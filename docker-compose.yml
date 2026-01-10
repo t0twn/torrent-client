@@ -1,0 +1,10 @@
+services:
+  torrent-client:
+    image: t0twn/torrent-client:latest
+    restart: unless-stopped
+    env_file:
+      - path: ./env/default.env
+        required: false
+      - path: ./env/override.env
+        required: true
+    network_mode: "host"
