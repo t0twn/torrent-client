@@ -469,6 +469,8 @@ def add_torrent(torrent):
     tp.save_path = OPTIONS.save_path
     tp.storage_mode = lt.storage_mode_t.storage_mode_sparse
     tp.flags |= lt.torrent_flags.duplicate_is_error | lt.torrent_flags.paused
+    if not OPTIONS.download_mode:
+        tp.flags |= lt.torrent_flags.upload_mode
     SESSION.async_add_torrent(tp)
 
 
