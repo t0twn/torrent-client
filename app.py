@@ -5,8 +5,10 @@ import sys
 import time
 import atexit
 import logging
+import queue
 import threading
 import datetime as dt
+from collections import deque
 from optparse import OptionParser
 from typing import List, Optional
 
@@ -46,6 +48,8 @@ global REMOTE_STORAGE_ENDPOINT
 
 ENGINE = None
 REMOTE_STORAGE_ENDPOINT = None
+_HTTP_SESSION = None  # lazily initialized requests.Session for connection reuse
+METADATA_QUEUE = None
 
 BOOTSTRAP = [
     'router.utorrent.com:6881',
@@ -56,6 +60,33 @@ BOOTSTRAP = [
 
 TORRENT_DIR = "./torrent"
 URL_TRACKER_LIST = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
+RESUME_SAVE_TIMEOUT = 30
+METADATA_QUEUE_SIZE = 20
+METADATA_DRAIN_TIMEOUT = 30
+MAX_TORRENTS = 100
+TORRENT_TTL = 600
+STATUS_RENDER_INTERVAL = 1.0
+STATUS_UPDATE_INTERVAL = 2.0
+
+
+def utc_now():
+    """Return naive UTC for compatibility with the existing DateTime columns."""
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
+def get_http_session():
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        _HTTP_SESSION = requests.Session()
+        atexit.register(_HTTP_SESSION.close)
+    return _HTTP_SESSION
+
+
+def safe_resume_path(name, info_hash):
+    """Build a resume path that cannot escape OPTIONS.save_path."""
+    safe_name = str(name or "").replace("/", "_").replace("\\", "_")
+    safe_name = safe_name.strip().strip(".")[:200] or info_hash
+    return os.path.join(OPTIONS.save_path, safe_name + ".fastresume")
 
 
 class Base(DeclarativeBase):
@@ -78,7 +109,7 @@ class Torrent(Base):
     private: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, default=dt.datetime.utcnow
+        DateTime, default=utc_now
     )
     files: Mapped[List["TorrentFile"]] = relationship(
         back_populates="torrent",
@@ -214,12 +245,16 @@ def assemble_torrent_db_object(torrent_info):
     try:
         ts = torrent_info.creation_date()
         if ts:
-            creation_date = dt.datetime.utcfromtimestamp(ts)
+            creation_date = dt.datetime.fromtimestamp(
+                ts, tz=dt.timezone.utc
+            ).replace(tzinfo=None)
     except Exception:
         pass
 
     files = []
     for file_entry in torrent_info.files():
+        # Keep the established API/database unit (whole MiB). Changing this
+        # requires an explicit migration for existing rows and remote clients.
         file_size = int(file_entry.size / 1024 / 1024)
         file_name = file_entry.path
 
@@ -252,14 +287,20 @@ def save_torrent_db_object(torrent):
                 logging.warning("remote storage endpoint missing, skip save")
                 return
             try:
-                resp = requests.post(REMOTE_STORAGE_ENDPOINT, json=torrent_db_object.to_dict(), timeout=5)
-                logging.info(resp.text)
+                resp = get_http_session().post(
+                    REMOTE_STORAGE_ENDPOINT,
+                    json=torrent_db_object.to_dict(),
+                    timeout=5
+                )
+                resp.raise_for_status()
             except Exception as e:
                 logging.warning("failed to post torrent object: %s", e)
             return
 
         with Session(ENGINE) as session:
-            exists = session.query(Torrent).filter_by(info_hash=torrent_db_object.info_hash).first()
+            exists = session.execute(
+                select(Torrent).filter_by(info_hash=torrent_db_object.info_hash)
+            ).scalar_one_or_none()
             if exists:
                 return
             session.add(torrent_db_object)
@@ -289,7 +330,19 @@ class TTLDict(object):
         for k in expired:
             del self._data[k]
 
-    def __setitem__(self, key, value):
+    def _get_unexpired(self, key):
+        value, expires_at = self._data[key]
+        if expires_at <= time.monotonic():
+            del self._data[key]
+            raise KeyError(key)
+        return value
+
+    def __delitem__(self, key):
+        with self._lock:
+            del self._data[key]
+
+    def put(self, key, value):
+        """Set a value, returning False when a new key exceeds capacity."""
         with self._lock:
             self._purge_expired()
 
@@ -305,11 +358,21 @@ class TTLDict(object):
             self._data[key] = (value, time.monotonic() + self.ttl)
             return True
 
-    def __getitem__(self, key):
+    def add_if_absent(self, key, value):
+        """Reserve a new key without refreshing or replacing an existing key."""
         with self._lock:
             self._purge_expired()
-            value, _ = self._data[key]
-            return value
+            if key in self._data or len(self._data) >= self.maxsize:
+                return False
+            self._data[key] = (value, time.monotonic() + self.ttl)
+            return True
+
+    def __setitem__(self, key, value):
+        self.put(key, value)
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._get_unexpired(key)
 
     def get(self, key, default=None):
         try:
@@ -319,8 +382,11 @@ class TTLDict(object):
 
     def __contains__(self, key):
         with self._lock:
-            self._purge_expired()
-            return key in self._data
+            try:
+                self._get_unexpired(key)
+            except KeyError:
+                return False
+            return True
 
     def __len__(self):
         with self._lock:
@@ -347,12 +413,10 @@ class TTLDict(object):
 
 def add_suffix(val):
     prefix = ['B', 'kB', 'MB', 'GB', 'TB']
-    for i in range(len(prefix)):
+    for i, unit in enumerate(prefix):
         if abs(val) < 1000:
-            if i == 0:
-                return '%5.3g%s' % (val, prefix[i])
-            else:
-                return '%4.3g%s' % (val, prefix[i])
+            fmt = '%5.3g%s' if i == 0 else '%4.3g%s'
+            return fmt % (val, unit)
         val /= 1000
     return '%6.3gPB' % val
 
@@ -426,7 +490,7 @@ def print_download_queue(download_queue):
 def read_best_trackers():
     trackers = []
     try:
-        resp = requests.get(URL_TRACKER_LIST, timeout=10)
+        resp = get_http_session().get(URL_TRACKER_LIST, timeout=10)
         resp.raise_for_status()
     except Exception as e:
         logging.warning("failed to fetch trackers list: %s", e)
@@ -444,34 +508,65 @@ def read_best_trackers():
 def add_torrent(torrent):
     """支持 .torrent 路径 / 磁力 / 40位info_hash。"""
     tp = lt.add_torrent_params()
+    reserved_info_hash = None
 
     if len(torrent) == 40 and all(c in "0123456789abcdefABCDEF" for c in torrent):
         # 直接 info_hash
         info_hash_str = torrent.lower()
-        # 先在 TTL 中标记一下，避免短时间内重复 add
-        TORRENTS[info_hash_str] = None
+        # Reserve capacity before adding to libtorrent. Assignment cannot
+        # report a full TTLDict, so this must use the explicit API.
+        if not TORRENTS.add_if_absent(info_hash_str, None):
+            logging.debug("torrent duplicate or capacity reached: %s", info_hash_str)
+            return False
+        reserved_info_hash = info_hash_str
         torrent = f"magnet:?xt=urn:btih:{info_hash_str}"
         if OPTIONS.download_mode and TRACKERS:
             torrent += "&tr=" + "&tr=".join(TRACKERS)
 
-    if torrent.startswith('magnet:'):
-        tp = lt.parse_magnet_uri(torrent)
-    else:
-        ti = lt.torrent_info(torrent)
-        resume_file = os.path.join(OPTIONS.save_path, ti.name() + '.fastresume')
-        try:
-            with open(resume_file, 'rb') as f:
-                tp = lt.read_resume_data(f.read())
-        except Exception as e:
-            logging.error('failed to open resume file "%s": %s', resume_file, e)
-        tp.ti = ti
+    try:
+        if torrent.startswith('magnet:'):
+            tp = lt.parse_magnet_uri(torrent)
+        else:
+            ti = lt.torrent_info(torrent)
+            info_hashes = ti.info_hashes()
+            if info_hashes.has_v1():
+                info_hash = str(info_hashes.v1)
+            else:
+                info_hash = str(info_hashes.v2)
+            resume_file = safe_resume_path(ti.name(), info_hash)
+            if os.path.exists(resume_file):
+                try:
+                    with open(resume_file, 'rb') as f:
+                        tp = lt.read_resume_data(f.read())
+                except Exception as e:
+                    logging.error('failed to read resume file "%s": %s', resume_file, e)
+            tp.ti = ti
 
-    tp.save_path = OPTIONS.save_path
-    tp.storage_mode = lt.storage_mode_t.storage_mode_sparse
-    tp.flags |= lt.torrent_flags.duplicate_is_error | lt.torrent_flags.paused
-    if not OPTIONS.download_mode:
-        tp.flags |= lt.torrent_flags.upload_mode
-    SESSION.async_add_torrent(tp)
+        if reserved_info_hash is None:
+            candidate_hash = get_info_hash(tp.info_hashes)
+            if candidate_hash is not None:
+                if not TORRENTS.add_if_absent(candidate_hash, None):
+                    logging.debug(
+                        "torrent duplicate or capacity reached: %s",
+                        candidate_hash
+                    )
+                    return False
+                reserved_info_hash = candidate_hash
+
+        tp.save_path = OPTIONS.save_path
+        tp.storage_mode = lt.storage_mode_t.storage_mode_sparse
+        tp.flags |= lt.torrent_flags.duplicate_is_error | lt.torrent_flags.paused
+        if not OPTIONS.download_mode:
+            tp.flags |= lt.torrent_flags.upload_mode
+        SESSION.async_add_torrent(tp)
+    except Exception:
+        if reserved_info_hash is not None:
+            try:
+                del TORRENTS[reserved_info_hash]
+            except KeyError:
+                pass
+        raise
+    return True
 
 
 def parse_option():
@@ -531,6 +626,13 @@ def parse_option():
 
 
 def init_settings():
+    alert_mask = (
+        lt.alert.category_t.error_notification
+        | lt.alert.category_t.storage_notification
+        | lt.alert.category_t.status_notification
+        | lt.alert.category_t.dht_notification
+        | lt.alert.category_t.dht_log_notification
+    )
     settings = {
         'user_agent': 'python_client/' + lt.__version__,
         'enable_dht': bool(OPTIONS.enable_dht),
@@ -538,7 +640,9 @@ def init_settings():
         'listen_interfaces': '%s:%d' % (OPTIONS.listen_interface, OPTIONS.port),
         'download_rate_limit': int(OPTIONS.max_download_rate),
         'upload_rate_limit': int(OPTIONS.max_upload_rate),
-        'alert_mask': lt.alert.category_t.all_categories,
+        'alert_mask': alert_mask,
+        'active_limit': MAX_TORRENTS,
+        'connections_limit': 200,
         'outgoing_interfaces': OPTIONS.outgoing_interface,
     }
 
@@ -651,35 +755,11 @@ def check_status():
         CONSOLE.write(line)
 
 
-def handle_alert_metadata_received(a):
-    # sniff 模式下只做缓存 .torrent
-    if OPTIONS.download_mode:
-        return
-
-    if isinstance(a, lt.metadata_received_alert):
-        handle = a.handle
-        if not handle.is_valid():
-            return
-
-        handle.pause()
-        status = handle.status()
-        torrent_file = status.torrent_file
-        if torrent_file is None:
-            return
-
+def persist_torrent_metadata(torrent_file, info_hash):
+    """Persist metadata outside the latency-sensitive alert loop."""
+    try:
         torrent_obj = lt.create_torrent(torrent_file)
-        if not os.path.exists(TORRENT_DIR):
-            os.makedirs(TORRENT_DIR, exist_ok=True)
-
-        try:
-            info_hashes = torrent_file.info_hashes()
-            if info_hashes.has_v1():
-                info_hash = str(info_hashes.v1)
-            else:
-                info_hash = str(info_hashes.v2)
-        except Exception:
-            info_hash = status.name
-
+        os.makedirs(TORRENT_DIR, exist_ok=True)
         save_torrent_db_object(torrent_file)
 
         cache_file = os.path.join(TORRENT_DIR, info_hash + '.torrent')
@@ -687,37 +767,97 @@ def handle_alert_metadata_received(a):
             f.write(lt.bencode(torrent_obj.generate()))
 
         logging.info("torrent cached: %s", info_hash)
-        SESSION.remove_torrent(handle)
-        del_handle_torrents(handle)
+    except Exception as e:
+        logging.warning("failed to persist torrent %s: %s", info_hash, e)
 
 
-def _seconds_until_next_sunday(target_hour=3):
+def metadata_worker():
+    while True:
+        torrent_file, info_hash = METADATA_QUEUE.get()
+        try:
+            persist_torrent_metadata(torrent_file, info_hash)
+        finally:
+            try:
+                del TORRENTS[info_hash]
+            except KeyError:
+                pass
+            METADATA_QUEUE.task_done()
+
+
+def wait_for_metadata_jobs(timeout=METADATA_DRAIN_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while METADATA_QUEUE.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return METADATA_QUEUE.unfinished_tasks == 0
+
+
+def handle_alert_metadata_received(a):
+    # sniff 模式下只做缓存 .torrent
+    if OPTIONS.download_mode or not isinstance(a, lt.metadata_received_alert):
+        return
+
+    handle = a.handle
+    if not handle.is_valid():
+        return
+
+    handle.pause()
+    status = handle.status()
+    torrent_file = status.torrent_file
+    if torrent_file is None:
+        return
+
+    try:
+        info_hashes = torrent_file.info_hashes()
+        info_hash = get_info_hash(info_hashes)
+    except Exception as e:
+        logging.warning("failed to read torrent info-hash: %s", e)
+        info_hash = get_handle_info_hash(handle)
+
+    queued = False
+    if info_hash is None:
+        logging.warning("dropping metadata with no valid info-hash")
+    elif not TORRENTS.put(info_hash, None):
+        logging.warning("torrent capacity reached, dropping metadata: %s", info_hash)
+    else:
+        try:
+            METADATA_QUEUE.put_nowait((torrent_file, info_hash))
+            queued = True
+        except queue.Full:
+            logging.warning("metadata queue full, dropping torrent: %s", info_hash)
+
+    # Keep a TTL reservation while the background worker persists this hash.
+    if not queued:
+        del_handle_torrents(handle, info_hash)
+    SESSION.remove_torrent(handle)
+
+
+def _seconds_until_next_cleanup(target_hour=3):
     now = dt.datetime.now()
-    days_ahead = (6 - now.weekday()) % 7
-    if days_ahead == 0 and now.hour >= target_hour:
-        days_ahead = 7
-    next_run = (now + dt.timedelta(days=days_ahead)).replace(
+    next_run = now.replace(
         hour=target_hour, minute=0, second=0, microsecond=0
     )
-    return max(0, int((next_run - now).total_seconds()))
+    if next_run <= now:
+        next_run += dt.timedelta(days=1)
+    return max(1, int((next_run - now).total_seconds()))
 
 
 def cleanup_old_cache_files(days=7):
     if not os.path.isdir(TORRENT_DIR):
         return
     cutoff = time.time() - days * 24 * 3600
-    for name in os.listdir(TORRENT_DIR):
-        path = os.path.join(TORRENT_DIR, name)
+    for entry in os.scandir(TORRENT_DIR):
+        if not entry.name.endswith(".torrent"):
+            continue
         try:
-            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
-                os.remove(path)
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                os.remove(entry.path)
         except Exception as e:
-            logging.warning("failed to remove cache file %s: %s", path, e)
+            logging.warning("failed to remove cache file %s: %s", entry.path, e)
 
 
 def cache_cleanup_loop():
     while True:
-        time.sleep(_seconds_until_next_sunday())
+        time.sleep(_seconds_until_next_cleanup())
         cleanup_old_cache_files()
 
 
@@ -748,7 +888,7 @@ def handle_alert_announce_peer(a):
                 except Exception:
                     return
 
-                info_hash_file = os.path.join(OPTIONS.save_path, info_hash + '.torrent')
+                info_hash_file = os.path.join(TORRENT_DIR, info_hash + '.torrent')
                 if os.path.exists(info_hash_file):
                     logging.debug("torrent local detected: %s skip", info_hash)
                     return
@@ -759,37 +899,39 @@ def handle_alert_announce_peer(a):
                 add_torrent(info_hash)
 
 
+def get_info_hash(info_hashes):
+    """Return a string info-hash, preferring v1 for DHT compatibility."""
+    ihs = info_hashes
+    if ihs.has_v1():
+        return str(ihs.v1)
+    if ihs.has_v2():
+        return str(ihs.v2)
+    return None
+
+
 def get_handle_info_hash(handle):
-    """统一返回字符串形式的 info_hash（优先 v2）。"""
-    if not hasattr(handle, "_info_hash_cached"):
+    try:
         if not handle.is_valid():
             return None
-        status = handle.status()
-        ihs = status.info_hashes
-        # libtorrent 2.x: has_v2()/has_v1()
-        if ihs.has_v2():
-            info_hash = str(ihs.v2)
-        else:
-            info_hash = str(ihs.v1)
-        handle._info_hash_cached = info_hash
-    return handle._info_hash_cached
+        return get_info_hash(handle.status().info_hashes)
+    except Exception:
+        return None
 
 
-def add_handle_torrents(handle):
-    info_hash = get_handle_info_hash(handle)
+def add_handle_torrents(handle, info_hash=None):
+    info_hash = info_hash or get_handle_info_hash(handle)
     if info_hash is None:
-        return
-    TORRENTS[info_hash] = handle
+        return False
+    return TORRENTS.put(info_hash, handle)
 
 
-def del_handle_torrents(handle):
-    info_hash = get_handle_info_hash(handle)
+def del_handle_torrents(handle, info_hash=None):
+    info_hash = info_hash or get_handle_info_hash(handle)
     if info_hash is None:
         return
     try:
-        # TTLDict 会自动清理
-        TORRENTS[info_hash] = None
-    except Exception:
+        del TORRENTS[info_hash]
+    except KeyError:
         pass
 
 
@@ -798,17 +940,28 @@ def handle_alert_state_update(a):
         for s in a.status:
             if not s.handle.is_valid():
                 continue
-            add_handle_torrents(s.handle)
+            info_hash = get_info_hash(s.info_hashes)
+            if not add_handle_torrents(s.handle, info_hash):
+                logging.warning("torrent capacity reached, removing %s", info_hash)
+                SESSION.remove_torrent(s.handle)
 
 
 def handle_alert_add_torrent(a):
     if isinstance(a, lt.add_torrent_alert):
         handle = a.handle
         if not handle.is_valid():
+            try:
+                info_hash = get_info_hash(a.params.info_hashes)
+                if info_hash and TORRENTS.get(info_hash) is None:
+                    del TORRENTS[info_hash]
+            except (AttributeError, KeyError):
+                pass
             return
         handle.set_max_connections(60)
         handle.set_max_uploads(-1)
-        add_handle_torrents(handle)
+        if not add_handle_torrents(handle):
+            logging.warning("torrent capacity reached, removing added torrent")
+            SESSION.remove_torrent(handle)
 
 
 def handle_alert_log(a):
@@ -853,11 +1006,9 @@ def print_alerts_log():
     if not OPTIONS.print_alerts_log:
         return
 
-    global ALERTS_LOG
-    if len(ALERTS_LOG) > 20:
-        ALERTS_LOG = ALERTS_LOG[-20:]
-
-    for a in ALERTS_LOG:
+    alerts = list(ALERTS_LOG)
+    ALERTS_LOG.clear()
+    for a in alerts:
         CONSOLE.write(a + '\n')
 
 
@@ -868,57 +1019,100 @@ def alert_handle():
     global ALERTS_LOG
 
     ALIVE = True
-    ALERTS_LOG = []
+    ALERTS_LOG = deque(maxlen=20)
+    next_render = 0.0
+    next_status_update = 0.0
 
     while ALIVE:
-        check_status()
+        now = time.monotonic()
+        if now >= next_render:
+            check_status()
+            next_render = now + STATUS_RENDER_INTERVAL
+
         handle_alerts()
         print_alerts_log()
 
         c = CONSOLE.sleep_and_input(0.5)
         check_console(c)
 
-        # 请求状态更新，用于 state_update_alert
-        SESSION.post_torrent_updates()
+        if now >= next_status_update:
+            # 请求状态更新，用于 state_update_alert
+            SESSION.post_torrent_updates()
+            next_status_update = now + STATUS_UPDATE_INTERVAL
 
     # 退出时保存 resume data
     SESSION.pause()
-    for _, handle in TORRENTS.items():
+    handles_to_save = {}
+    for info_hash, handle in list(TORRENTS.items()):
         if not handle or not handle.is_valid():
+            # Handle invalid / None (already removed from session): drop it now
+            # so it doesn't block the drain loop below.
+            try:
+                del TORRENTS[info_hash]
+            except KeyError:
+                pass
             continue
         try:
             if not handle.status().has_metadata:
+                # No metadata → nothing to resume; drop to avoid blocking exit.
+                del_handle_torrents(handle, info_hash)
                 continue
         except Exception:
+            del_handle_torrents(handle, info_hash)
             continue
-        handle.save_resume_data()
+        handles_to_save[info_hash] = handle
+
+    pending_resume = set()
+    for info_hash, handle in handles_to_save.items():
+        try:
+            handle.save_resume_data()
+        except Exception as e:
+            logging.error("failed to request resume data for %s: %s", info_hash, e)
+            del_handle_torrents(handle, info_hash)
+        else:
+            pending_resume.add(info_hash)
 
     # 等待保存完成
-    while len(TORRENTS) > 0:
+    deadline = time.monotonic() + RESUME_SAVE_TIMEOUT
+    while pending_resume and time.monotonic() < deadline:
         alerts = SESSION.pop_alerts()
         for a in alerts:
             if isinstance(a, lt.save_resume_data_alert):
                 data = lt.write_resume_data_buf(a.params)
                 handle = a.handle
                 info_hash = get_handle_info_hash(handle)
-                if info_hash in TORRENTS:
+                if info_hash in pending_resume:
                     resume_name = handle.status().name or info_hash
-                    path = os.path.join(OPTIONS.save_path, resume_name + '.fastresume')
+                    path = safe_resume_path(resume_name, info_hash)
                     try:
                         with open(path, 'wb') as f:
                             f.write(data)
                     except Exception as e:
                         logging.error("failed to write resume file '%s': %s", path, e)
-                    del_handle_torrents(handle)
+                    pending_resume.discard(info_hash)
+                    del_handle_torrents(handle, info_hash)
 
             if isinstance(a, lt.save_resume_data_failed_alert):
                 handle = a.handle
                 info_hash = get_handle_info_hash(handle)
-                if info_hash in TORRENTS:
+                if info_hash in pending_resume:
                     logging.error('failed to save resume data for %s', handle.status().name)
-                    del_handle_torrents(handle)
+                    pending_resume.discard(info_hash)
+                    del_handle_torrents(handle, info_hash)
 
         time.sleep(0.5)
+
+    if pending_resume:
+        logging.error(
+            "timed out waiting for resume data: %s",
+            ", ".join(sorted(pending_resume))
+        )
+
+    if not wait_for_metadata_jobs():
+        logging.error(
+            "timed out waiting for %d metadata jobs",
+            METADATA_QUEUE.unfinished_tasks
+        )
 
 
 # -------------------- main --------------------
@@ -931,6 +1125,7 @@ def main():
     global TORRENTS
     global ENGINE
     global REMOTE_STORAGE_ENDPOINT
+    global METADATA_QUEUE
 
     CONSOLE = get_console()
     OPTIONS, args = parse_option()
@@ -955,10 +1150,15 @@ def main():
     # 读取 tracker 列表（失败不会中断）
     TRACKERS = read_best_trackers()
 
-    # 用 TTL 去重 info_hash
-    TORRENTS = TTLDict(maxsize=100, ttl=600)
+    # 用 TTL 去重 info_hash，并严格限制 libtorrent session 的 torrent 数量
+    TORRENTS = TTLDict(maxsize=MAX_TORRENTS, ttl=TORRENT_TTL)
 
-    # 启动每周缓存清理线程（周天执行一次）
+    # 持久化可能包含网络和磁盘 I/O，使用有界队列避免阻塞 alert 消费。
+    METADATA_QUEUE = queue.Queue(maxsize=METADATA_QUEUE_SIZE)
+    metadata_thread = threading.Thread(target=metadata_worker, daemon=True)
+    metadata_thread.start()
+
+    # 每日清理过期缓存
     cleanup_thread = threading.Thread(target=cache_cleanup_loop, daemon=True)
     cleanup_thread.start()
 

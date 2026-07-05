@@ -1,1 +1,11 @@
 env/override.env
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Runtime state
+torrents.db
+save_path/
+torrent/
