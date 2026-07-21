@@ -47,6 +47,29 @@ class TTLDictTests(unittest.TestCase):
 
 
 class HelperTests(unittest.TestCase):
+    def test_env_int_uses_default_and_parses_override(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(app.env_int("TEST_INTEGER", 10), 10)
+
+        with patch.dict(os.environ, {"TEST_INTEGER": "42"}):
+            self.assertEqual(app.env_int("TEST_INTEGER", 10), 42)
+
+    def test_env_float_parses_override(self):
+        with patch.dict(os.environ, {"TEST_FLOAT": "0.25"}):
+            self.assertEqual(app.env_float("TEST_FLOAT", 1.0), 0.25)
+
+    def test_env_list_splits_and_ignores_empty_items(self):
+        with patch.dict(os.environ, {"TEST_LIST": "one, two, ,three"}):
+            self.assertEqual(
+                app.env_list("TEST_LIST", ["default"]),
+                ["one", "two", "three"]
+            )
+
+    def test_invalid_numeric_environment_variable_is_rejected(self):
+        with patch.dict(os.environ, {"TEST_INTEGER": "invalid"}):
+            with self.assertRaisesRegex(ValueError, "TEST_INTEGER"):
+                app.env_int("TEST_INTEGER", 10)
+
     def test_utc_now_is_naive_utc(self):
         before = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         value = app.utc_now()

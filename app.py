@@ -51,22 +51,54 @@ REMOTE_STORAGE_ENDPOINT = None
 _HTTP_SESSION = None  # lazily initialized requests.Session for connection reuse
 METADATA_QUEUE = None
 
-BOOTSTRAP = [
+
+def env_int(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer") from exc
+
+
+def env_float(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be a number") from exc
+
+
+def env_list(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+DEFAULT_BOOTSTRAP = [
     'router.utorrent.com:6881',
     'router.bitcomet.com:6881',
     'router.bittorrent.com:6881',
     'dht.transmissionbt.com:6881'
 ]
 
-TORRENT_DIR = "./torrent"
-URL_TRACKER_LIST = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
-RESUME_SAVE_TIMEOUT = 30
-METADATA_QUEUE_SIZE = 20
-METADATA_DRAIN_TIMEOUT = 30
-MAX_TORRENTS = 100
-TORRENT_TTL = 600
-STATUS_RENDER_INTERVAL = 1.0
-STATUS_UPDATE_INTERVAL = 2.0
+BOOTSTRAP = env_list("BOOTSTRAP", DEFAULT_BOOTSTRAP)
+TORRENT_DIR = os.getenv("TORRENT_DIR", "./torrent")
+URL_TRACKER_LIST = os.getenv(
+    "URL_TRACKER_LIST",
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
+)
+RESUME_SAVE_TIMEOUT = env_int("RESUME_SAVE_TIMEOUT", 30)
+METADATA_QUEUE_SIZE = env_int("METADATA_QUEUE_SIZE", 20)
+METADATA_DRAIN_TIMEOUT = env_int("METADATA_DRAIN_TIMEOUT", 30)
+MAX_TORRENTS = env_int("MAX_TORRENTS", 100)
+TORRENT_TTL = env_int("TORRENT_TTL", 600)
+STATUS_RENDER_INTERVAL = env_float("STATUS_RENDER_INTERVAL", 1.0)
+STATUS_UPDATE_INTERVAL = env_float("STATUS_UPDATE_INTERVAL", 2.0)
 
 
 def utc_now():
