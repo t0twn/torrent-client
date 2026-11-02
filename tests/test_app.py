@@ -167,6 +167,23 @@ class HelperTests(unittest.TestCase):
 
         self.assertFalse(added)
 
+    def test_console_actions_use_shared_management_service(self):
+        actions = []
+        service = SimpleNamespace(
+            action=lambda selector, action: actions.append((selector, action))
+        )
+        dispatcher = SimpleNamespace(service=service)
+
+        with patch.object(app, "MANAGEMENT_DISPATCHER", dispatcher):
+            app.check_console("p")
+            app.check_console("u")
+            app.check_console("r")
+
+        self.assertEqual(
+            actions,
+            [("all", "pause"), ("all", "resume"), ("all", "reannounce")]
+        )
+
 
 class TorrentAssemblyTests(unittest.TestCase):
     @staticmethod

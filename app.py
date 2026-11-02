@@ -6,6 +6,7 @@ import time
 import atexit
 import logging
 import queue
+import socket
 import threading
 import datetime as dt
 from collections import deque
@@ -14,6 +15,8 @@ from typing import List, Optional
 
 import requests
 import libtorrent as lt
+
+from management import CommandDispatcher, ManagementService, start_management_server
 
 from sqlalchemy import (
     BigInteger,
@@ -50,6 +53,8 @@ ENGINE = None
 REMOTE_STORAGE_ENDPOINT = None
 _HTTP_SESSION = None  # lazily initialized requests.Session for connection reuse
 METADATA_QUEUE = None
+MANAGEMENT_DISPATCHER = None
+MANAGEMENT_SERVER = None
 
 
 def env_int(name, default):
@@ -538,11 +543,11 @@ def read_best_trackers():
 # -------------------- Torrent add / settings --------------------
 
 def add_torrent(torrent):
-    """支持 .torrent 路径 / 磁力 / 40位info_hash。"""
+    """支持 .torrent 路径 / 磁力 / v1 或 v2 info_hash。"""
     tp = lt.add_torrent_params()
     reserved_info_hash = None
 
-    if len(torrent) == 40 and all(c in "0123456789abcdefABCDEF" for c in torrent):
+    if len(torrent) in {40, 64} and all(c in "0123456789abcdefABCDEF" for c in torrent):
         # 直接 info_hash
         info_hash_str = torrent.lower()
         # Reserve capacity before adding to libtorrent. Assignment cannot
@@ -551,7 +556,10 @@ def add_torrent(torrent):
             logging.debug("torrent duplicate or capacity reached: %s", info_hash_str)
             return False
         reserved_info_hash = info_hash_str
-        torrent = f"magnet:?xt=urn:btih:{info_hash_str}"
+        if len(info_hash_str) == 40:
+            torrent = f"magnet:?xt=urn:btih:{info_hash_str}"
+        else:
+            torrent = f"magnet:?xt=urn:btmh:1220{info_hash_str}"
         if OPTIONS.download_mode and TRACKERS:
             torrent += "&tr=" + "&tr=".join(TRACKERS)
 
@@ -624,6 +632,18 @@ def parse_option():
     parser.add_option('--download_mode', type='int', help='download mode (1) or sniff-only (0)')
     parser.add_option('--enable_dht', type='int', help='enable dht (1/0)')
     parser.add_option('--use_local_storage', type='int', help='enable local storage (1/0)')
+    parser.add_option(
+        '--management-host', type='string',
+        help='management HTTP bind address (default: MANAGEMENT_HOST or 127.0.0.1)'
+    )
+    parser.add_option(
+        '--management-port', type='int',
+        help='management HTTP port; 0 disables it (default: MANAGEMENT_PORT or 0)'
+    )
+    parser.add_option(
+        '--management-allow-remote', action='store_true',
+        help='explicitly permit a non-loopback management bind'
+    )
 
     parser.set_defaults(
         port=6881,
@@ -638,7 +658,10 @@ def parse_option():
         print_alerts_log=0,
         download_mode=0,
         enable_dht=1,
-        use_local_storage=0
+        use_local_storage=0,
+        management_host=os.getenv("MANAGEMENT_HOST", "127.0.0.1"),
+        management_port=env_int("MANAGEMENT_PORT", 0),
+        management_allow_remote=False,
     )
 
     (options, args) = parser.parse_args()
@@ -1019,19 +1042,16 @@ def check_console(c):
 
     c = c.lower()
     if c == 'r':
-        for _, handle in TORRENTS.items():
-            if handle and handle.is_valid():
-                handle.force_reannounce()
+        if MANAGEMENT_DISPATCHER:
+            MANAGEMENT_DISPATCHER.service.action("all", "reannounce")
     elif c == 'q':
         ALIVE = False
     elif c == 'p':
-        for _, handle in TORRENTS.items():
-            if handle and handle.is_valid():
-                handle.pause()
+        if MANAGEMENT_DISPATCHER:
+            MANAGEMENT_DISPATCHER.service.action("all", "pause")
     elif c == 'u':
-        for _, handle in TORRENTS.items():
-            if handle and handle.is_valid():
-                handle.resume()
+        if MANAGEMENT_DISPATCHER:
+            MANAGEMENT_DISPATCHER.service.action("all", "resume")
 
 
 def print_alerts_log():
@@ -1062,6 +1082,8 @@ def alert_handle():
             next_render = now + STATUS_RENDER_INTERVAL
 
         handle_alerts()
+        if MANAGEMENT_DISPATCHER:
+            MANAGEMENT_DISPATCHER.drain()
         print_alerts_log()
 
         c = CONSOLE.sleep_and_input(0.5)
@@ -1158,6 +1180,8 @@ def main():
     global ENGINE
     global REMOTE_STORAGE_ENDPOINT
     global METADATA_QUEUE
+    global MANAGEMENT_DISPATCHER
+    global MANAGEMENT_SERVER
 
     CONSOLE = get_console()
     OPTIONS, args = parse_option()
@@ -1185,6 +1209,35 @@ def main():
     # 用 TTL 去重 info_hash，并严格限制 libtorrent session 的 torrent 数量
     TORRENTS = TTLDict(maxsize=MAX_TORRENTS, ttl=TORRENT_TTL)
 
+    instance_id = os.getenv("MANAGEMENT_INSTANCE_ID", "").strip() or socket.gethostname()
+    management_service = ManagementService(
+        SESSION,
+        TORRENTS,
+        add_torrent,
+        instance_id=instance_id,
+        mode="download" if OPTIONS.download_mode else "sniff",
+    )
+    MANAGEMENT_DISPATCHER = CommandDispatcher(management_service)
+    management_token = os.getenv("MANAGEMENT_TOKEN", "")
+    try:
+        MANAGEMENT_SERVER = start_management_server(
+            OPTIONS.management_host,
+            OPTIONS.management_port,
+            management_token,
+            OPTIONS.management_allow_remote,
+            MANAGEMENT_DISPATCHER,
+        )
+    except ValueError as exc:
+        logging.error("unsafe management configuration: %s", exc)
+        raise SystemExit(2) from exc
+    if MANAGEMENT_SERVER:
+        logging.info(
+            "management API listening on %s:%d",
+            OPTIONS.management_host,
+            OPTIONS.management_port,
+        )
+        atexit.register(MANAGEMENT_SERVER.server_close)
+
     # 持久化可能包含网络和磁盘 I/O，使用有界队列避免阻塞 alert 消费。
     METADATA_QUEUE = queue.Queue(maxsize=METADATA_QUEUE_SIZE)
     metadata_thread = threading.Thread(target=metadata_worker, daemon=True)
@@ -1197,9 +1250,13 @@ def main():
     # 启动时如果命令行带了 torrent/magnet，就进入下载模式
     for torrent in args:
         OPTIONS.download_mode = 1
+        management_service.mode = "download"
         add_torrent(torrent)
 
     alert_handle()
+    if MANAGEMENT_SERVER:
+        MANAGEMENT_SERVER.shutdown()
+        MANAGEMENT_SERVER.server_close()
 
 
 if __name__ == '__main__':
