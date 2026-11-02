@@ -32,6 +32,8 @@ uv run torrent-client
 
 The default management bind is `127.0.0.1`; this remains private even though `docker-compose.yml` uses host networking. `MANAGEMENT_INSTANCE_ID` defaults to the hostname and appears in every successful API response so an external aggregator can distinguish instances.
 
+Enabled listeners allow at most 16 active HTTP connections. A request has three seconds to complete its headers and five seconds to complete its POST body; incomplete requests are disconnected, and excess connections are closed. These are absolute deadlines, including clients that send data slowly in small pieces.
+
 A non-loopback bind is rejected unless `--management-allow-remote` is supplied. For access beyond the host, put the loopback listener behind an authenticated TLS reverse proxy whenever possible. Bearer tokens sent over plain HTTP can be intercepted. Do not reuse the public BitTorrent port or publish the management port directly to the internet.
 
 Supported environment settings are:
@@ -113,6 +115,8 @@ Each live torrent has these fields:
 
 The live endpoints reflect the in-process handle registry only. They do not report SQLite metadata rows as active torrents. The metadata storage contract remains unchanged: `Torrent.total_size` is bytes and `TorrentFile.file_size` is whole MiB.
 
+The live-handle inventory is independent of the expiring TTL cache used for discovery deduplication. A valid torrent stays visible and actionable after the deduplication entry expires; removal from the session removes it from the live inventory.
+
 Adding returns HTTP `202` with `status: "accepted"`; libtorrent completes the asynchronous add later. V1 accepts a magnet containing a v1 `btih` or SHA-256 `btmh` identifier, or a 40-character v1 / 64-character v2 info hash. It never accepts a server-side `.torrent` path or file upload. Duplicate and capacity conflicts return HTTP `409`.
 
 Errors have one shape:
@@ -121,7 +125,7 @@ Errors have one shape:
 {"error":{"code":"not_found","message":"live torrent not found"}}
 ```
 
-Common codes are `unauthorized` (401), `invalid_json` or `invalid_source` (400), `not_found` (404), `duplicate` or `capacity_reached` (409), `add_failed` (422), and `service_unavailable` (503). Unknown internal failures return a generic `internal_error` without exposing file paths or exception details.
+Common codes are `unauthorized` (401), `invalid_json` or `invalid_source` (400), `not_found` (404), `duplicate` or `capacity_reached` (409), `add_failed` (422), and `service_unavailable` (503). A queued command that times out before execution returns `command_cancelled` (503) and will not run later. If execution has already begun, the response is `outcome_unknown` (504); query the torrent state before retrying a mutation. Unknown internal failures return a generic `internal_error` without exposing file paths or exception details.
 
 ## Tests
 

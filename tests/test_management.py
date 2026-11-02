@@ -1,7 +1,9 @@
 import contextlib
 import io
 import json
+import socket
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -11,14 +13,15 @@ from unittest.mock import patch
 import torrentctl
 from management import (
     APIClient,
+    BoundedHTTPServer,
     CommandDispatcher,
+    LiveHandles,
     ManagementError,
     ManagementService,
     make_handler,
     normalize_source,
     validate_management_config,
 )
-from http.server import ThreadingHTTPServer
 
 
 HASH = "a" * 40
@@ -79,12 +82,34 @@ class FakeHandle:
 
 def make_service(registry=None, add_callback=lambda source: True):
     return ManagementService(
-        SimpleNamespace(), registry or FakeRegistry(), add_callback,
+        SimpleNamespace(), registry if registry is not None else FakeRegistry(), add_callback,
         instance_id="node-1", mode="download",
     )
 
 
 class ServiceTests(unittest.TestCase):
+    def test_live_inventory_survives_ttl_expiry(self):
+        from app import TTLDict
+
+        pending = TTLDict(maxsize=2, ttl=0.01)
+        live = LiveHandles(maxsize=2)
+        handle = FakeHandle()
+        pending.put(HASH, handle)
+        live.put(HASH, handle)
+        service = ManagementService(
+            SimpleNamespace(), live, lambda source: True,
+            instance_id="node-1", mode="download", pending_registry=pending,
+        )
+        time.sleep(0.03)
+
+        self.assertNotIn(HASH, pending)
+        self.assertEqual(service.status()["live_torrent_count"], 1)
+        self.assertEqual(service.get_torrent(HASH)["torrent"]["info_hash"], HASH)
+        self.assertEqual(service.action(HASH, "pause")["affected"], 1)
+        with self.assertRaises(ManagementError) as raised:
+            service.add_torrent(HASH)
+        self.assertEqual(raised.exception.code, "duplicate")
+
     def test_status_and_live_snapshot_have_explicit_units(self):
         handle = FakeHandle()
         service = make_service(FakeRegistry({HASH: handle}))
@@ -152,6 +177,40 @@ class ServiceTests(unittest.TestCase):
         thread.join()
         self.assertEqual(result[0]["instance_id"], "node-1")
 
+    def test_timed_out_queued_action_is_cancelled_before_delayed_drain(self):
+        handle = FakeHandle()
+        dispatcher = CommandDispatcher(make_service(FakeRegistry({HASH: handle})))
+
+        with self.assertRaises(ManagementError) as raised:
+            dispatcher.invoke("action", HASH, "pause", timeout=0.01)
+        self.assertEqual(raised.exception.code, "command_cancelled")
+
+        dispatcher.drain()
+        self.assertEqual(handle.calls, [])
+
+    def test_timeout_after_action_started_reports_unknown_outcome(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def action(selector, operation):
+            started.set()
+            release.wait(1)
+            calls.append((selector, operation))
+
+        dispatcher = CommandDispatcher(SimpleNamespace(action=action))
+        worker = threading.Thread(target=lambda: (time.sleep(0.01), dispatcher.drain()))
+        worker.start()
+        try:
+            with self.assertRaises(ManagementError) as raised:
+                dispatcher.invoke("action", HASH, "pause", timeout=0.1)
+            self.assertTrue(started.is_set())
+            self.assertEqual(raised.exception.code, "outcome_unknown")
+        finally:
+            release.set()
+            worker.join()
+        self.assertEqual(calls, [(HASH, "pause")])
+
 
 class ConfigTests(unittest.TestCase):
     def test_disabled_listener_needs_no_token(self):
@@ -179,12 +238,13 @@ class HTTPTests(unittest.TestCase):
     def setUp(self):
         self.registry = FakeRegistry({HASH: FakeHandle()})
         service = make_service(self.registry)
-        self.server = ThreadingHTTPServer(
-            ("127.0.0.1", 0), make_handler(ImmediateDispatcher(service), "secret")
+        self.server = BoundedHTTPServer(
+            ("127.0.0.1", 0), make_handler(ImmediateDispatcher(service), "secret"),
+            max_connections=1, header_timeout=0.3, body_timeout=0.3,
         )
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
-        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
 
     def tearDown(self):
         self.server.shutdown()
@@ -202,6 +262,10 @@ class HTTPTests(unittest.TestCase):
                 return response.status, json.load(response)
         except urllib.error.HTTPError as exc:
             return exc.code, json.load(exc)
+
+    def wait_for_slot(self):
+        self.assertTrue(self.server._slots.acquire(timeout=1))
+        self.server._slots.release()
 
     def test_auth_and_error_shape(self):
         status, payload = self.request("GET", "/api/v1/status", token="wrong")
@@ -231,6 +295,49 @@ class HTTPTests(unittest.TestCase):
 
         status, payload = self.request("POST", "/api/v1/torrents", body={"source": "/etc/passwd"})
         self.assertEqual((status, payload["error"]["code"]), (400, "invalid_source"))
+
+    def test_incomplete_header_expires_and_frees_connection_slot(self):
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1])) as stalled:
+            stalled.settimeout(2)
+            stalled.sendall(b"GET /api/v1/status HTTP/1.1\r\nHost: localhost\r\n")
+            self.assertEqual(stalled.recv(1024), b"")
+
+        self.wait_for_slot()
+        status, _ = self.request("GET", "/api/v1/status")
+        self.assertEqual(status, 200)
+
+    def test_slow_header_drip_cannot_extend_absolute_deadline(self):
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1])) as stalled:
+            stalled.settimeout(2)
+            stalled.sendall(b"GET /api/v1/status HTTP/1.1\r\nH")
+            for chunk in (b"o", b"s", b"t", b":"):
+                time.sleep(0.06)
+                stalled.sendall(chunk)
+            self.assertEqual(stalled.recv(1024), b"")
+        self.wait_for_slot()
+
+    def test_incomplete_body_expires_and_frees_connection_slot(self):
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1])) as stalled:
+            stalled.settimeout(2)
+            stalled.sendall(
+                b"POST /api/v1/torrents HTTP/1.1\r\n"
+                b"Host: localhost\r\nAuthorization: Bearer secret\r\n"
+                b"Content-Length: 100\r\n\r\n{"
+            )
+            self.assertEqual(stalled.recv(1024), b"")
+
+        self.wait_for_slot()
+        status, _ = self.request("GET", "/api/v1/status")
+        self.assertEqual(status, 200)
+
+    def test_connection_limit_rejects_second_client_while_first_is_stalled(self):
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1])) as stalled:
+            stalled.sendall(b"GET /api/v1/status HTTP/1.1\r\nHost: localhost\r\n")
+            time.sleep(0.05)
+            with socket.create_connection(("127.0.0.1", self.server.server_address[1])) as second:
+                second.settimeout(1)
+                second.sendall(b"GET /api/v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                self.assertEqual(second.recv(1024), b"")
 
 
 class CLITests(unittest.TestCase):

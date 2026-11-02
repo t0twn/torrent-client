@@ -184,6 +184,23 @@ class HelperTests(unittest.TestCase):
             [("all", "pause"), ("all", "resume"), ("all", "reannounce")]
         )
 
+    def test_live_handle_survives_expired_or_full_dedup_cache(self):
+        cache = app.TTLDict(maxsize=1, ttl=0.01)
+        live = app.LiveHandles(maxsize=1)
+        handle = SimpleNamespace(is_valid=lambda: True)
+
+        with (
+            patch.object(app, "TORRENTS", cache, create=True),
+            patch.object(app, "LIVE_HANDLES", live),
+        ):
+            self.assertTrue(app.add_handle_torrents(handle, "a" * 40))
+            time.sleep(0.02)
+            cache.put("b" * 40, None)
+            self.assertTrue(app.add_handle_torrents(handle, "a" * 40))
+            self.assertIs(live.get("a" * 40), handle)
+            app.del_handle_torrents(handle, "a" * 40)
+            self.assertNotIn("a" * 40, live)
+
 
 class TorrentAssemblyTests(unittest.TestCase):
     @staticmethod
