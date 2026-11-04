@@ -6,14 +6,18 @@ import time
 import atexit
 import logging
 import queue
+import socket
 import threading
 import datetime as dt
 from collections import deque
+from functools import partial
 from optparse import OptionParser
 from typing import List, Optional
 
 import requests
 import libtorrent as lt
+
+from management import CommandDispatcher, LiveHandles, ManagementService, start_management_server
 
 from sqlalchemy import (
     BigInteger,
@@ -39,6 +43,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 global SESSION
 global OPTIONS
 global TORRENTS
+global LIVE_HANDLES
 global TRACKERS
 global CONSOLE
 global ALIVE
@@ -50,6 +55,9 @@ ENGINE = None
 REMOTE_STORAGE_ENDPOINT = None
 _HTTP_SESSION = None  # lazily initialized requests.Session for connection reuse
 METADATA_QUEUE = None
+MANAGEMENT_DISPATCHER = None
+MANAGEMENT_SERVER = None
+LIVE_HANDLES = None
 
 
 def env_int(name, default):
@@ -537,23 +545,33 @@ def read_best_trackers():
 
 # -------------------- Torrent add / settings --------------------
 
-def add_torrent(torrent):
-    """支持 .torrent 路径 / 磁力 / 40位info_hash。"""
+def add_torrent(torrent, *, session=None, registry=None, live_handles=None, options=None, trackers=None):
+    """支持 .torrent 路径 / 磁力 / v1 或 v2 info_hash。"""
+    session = session if session is not None else SESSION
+    registry = registry if registry is not None else TORRENTS
+    live_handles = live_handles if live_handles is not None else LIVE_HANDLES
+    options = options if options is not None else OPTIONS
+    trackers = trackers if trackers is not None else TRACKERS
     tp = lt.add_torrent_params()
     reserved_info_hash = None
 
-    if len(torrent) == 40 and all(c in "0123456789abcdefABCDEF" for c in torrent):
+    if len(torrent) in {40, 64} and all(c in "0123456789abcdefABCDEF" for c in torrent):
         # 直接 info_hash
         info_hash_str = torrent.lower()
+        if live_handles is not None and info_hash_str in live_handles:
+            return False
         # Reserve capacity before adding to libtorrent. Assignment cannot
         # report a full TTLDict, so this must use the explicit API.
-        if not TORRENTS.add_if_absent(info_hash_str, None):
+        if not registry.add_if_absent(info_hash_str, None):
             logging.debug("torrent duplicate or capacity reached: %s", info_hash_str)
             return False
         reserved_info_hash = info_hash_str
-        torrent = f"magnet:?xt=urn:btih:{info_hash_str}"
-        if OPTIONS.download_mode and TRACKERS:
-            torrent += "&tr=" + "&tr=".join(TRACKERS)
+        if len(info_hash_str) == 40:
+            torrent = f"magnet:?xt=urn:btih:{info_hash_str}"
+        else:
+            torrent = f"magnet:?xt=urn:btmh:1220{info_hash_str}"
+        if options.download_mode and trackers:
+            torrent += "&tr=" + "&tr=".join(trackers)
 
     try:
         if torrent.startswith('magnet:'):
@@ -577,7 +595,9 @@ def add_torrent(torrent):
         if reserved_info_hash is None:
             candidate_hash = get_info_hash(tp.info_hashes)
             if candidate_hash is not None:
-                if not TORRENTS.add_if_absent(candidate_hash, None):
+                if live_handles is not None and candidate_hash in live_handles:
+                    return False
+                if not registry.add_if_absent(candidate_hash, None):
                     logging.debug(
                         "torrent duplicate or capacity reached: %s",
                         candidate_hash
@@ -585,16 +605,16 @@ def add_torrent(torrent):
                     return False
                 reserved_info_hash = candidate_hash
 
-        tp.save_path = OPTIONS.save_path
+        tp.save_path = options.save_path
         tp.storage_mode = lt.storage_mode_t.storage_mode_sparse
         tp.flags |= lt.torrent_flags.duplicate_is_error | lt.torrent_flags.paused
-        if not OPTIONS.download_mode:
+        if not options.download_mode:
             tp.flags |= lt.torrent_flags.upload_mode
-        SESSION.async_add_torrent(tp)
+        session.async_add_torrent(tp)
     except Exception:
         if reserved_info_hash is not None:
             try:
-                del TORRENTS[reserved_info_hash]
+                del registry[reserved_info_hash]
             except KeyError:
                 pass
         raise
@@ -624,6 +644,18 @@ def parse_option():
     parser.add_option('--download_mode', type='int', help='download mode (1) or sniff-only (0)')
     parser.add_option('--enable_dht', type='int', help='enable dht (1/0)')
     parser.add_option('--use_local_storage', type='int', help='enable local storage (1/0)')
+    parser.add_option(
+        '--management-host', type='string',
+        help='management HTTP bind address (default: MANAGEMENT_HOST or 127.0.0.1)'
+    )
+    parser.add_option(
+        '--management-port', type='int',
+        help='management HTTP port; 0 disables it (default: MANAGEMENT_PORT or 0)'
+    )
+    parser.add_option(
+        '--management-allow-remote', action='store_true',
+        help='explicitly permit a non-loopback management bind'
+    )
 
     parser.set_defaults(
         port=6881,
@@ -638,7 +670,10 @@ def parse_option():
         print_alerts_log=0,
         download_mode=0,
         enable_dht=1,
-        use_local_storage=0
+        use_local_storage=0,
+        management_host=os.getenv("MANAGEMENT_HOST", "127.0.0.1"),
+        management_port=env_int("MANAGEMENT_PORT", 0),
+        management_allow_remote=False,
     )
 
     (options, args) = parser.parse_args()
@@ -699,7 +734,7 @@ def check_status():
 
     CONSOLE.clear()
 
-    for info_hash, handle in TORRENTS.items():
+    for info_hash, handle in LIVE_HANDLES.items():
         out = ''
         if not handle or not handle.is_valid():
             continue
@@ -861,6 +896,8 @@ def handle_alert_metadata_received(a):
     if not queued:
         del_handle_torrents(handle, info_hash)
     SESSION.remove_torrent(handle)
+    if info_hash is not None and LIVE_HANDLES is not None:
+        LIVE_HANDLES.discard(info_hash)
 
 
 def _seconds_until_next_cleanup(target_hour=3):
@@ -954,13 +991,20 @@ def add_handle_torrents(handle, info_hash=None):
     info_hash = info_hash or get_handle_info_hash(handle)
     if info_hash is None:
         return False
-    return TORRENTS.put(info_hash, handle)
+    if LIVE_HANDLES is not None and not LIVE_HANDLES.put(info_hash, handle):
+        return False
+    # The TTL cache is only a short-lived deduplication hint. A full or
+    # expired cache must never evict a valid handle from the live inventory.
+    TORRENTS.put(info_hash, handle)
+    return True
 
 
 def del_handle_torrents(handle, info_hash=None):
     info_hash = info_hash or get_handle_info_hash(handle)
     if info_hash is None:
         return
+    if LIVE_HANDLES is not None:
+        LIVE_HANDLES.discard(info_hash)
     try:
         del TORRENTS[info_hash]
     except KeyError:
@@ -1019,19 +1063,16 @@ def check_console(c):
 
     c = c.lower()
     if c == 'r':
-        for _, handle in TORRENTS.items():
-            if handle and handle.is_valid():
-                handle.force_reannounce()
+        if MANAGEMENT_DISPATCHER:
+            MANAGEMENT_DISPATCHER.service.action("all", "reannounce")
     elif c == 'q':
         ALIVE = False
     elif c == 'p':
-        for _, handle in TORRENTS.items():
-            if handle and handle.is_valid():
-                handle.pause()
+        if MANAGEMENT_DISPATCHER:
+            MANAGEMENT_DISPATCHER.service.action("all", "pause")
     elif c == 'u':
-        for _, handle in TORRENTS.items():
-            if handle and handle.is_valid():
-                handle.resume()
+        if MANAGEMENT_DISPATCHER:
+            MANAGEMENT_DISPATCHER.service.action("all", "resume")
 
 
 def print_alerts_log():
@@ -1062,6 +1103,8 @@ def alert_handle():
             next_render = now + STATUS_RENDER_INTERVAL
 
         handle_alerts()
+        if MANAGEMENT_DISPATCHER:
+            MANAGEMENT_DISPATCHER.drain()
         print_alerts_log()
 
         c = CONSOLE.sleep_and_input(0.5)
@@ -1075,7 +1118,7 @@ def alert_handle():
     # 退出时保存 resume data
     SESSION.pause()
     handles_to_save = {}
-    for info_hash, handle in list(TORRENTS.items()):
+    for info_hash, handle in list(LIVE_HANDLES.items()):
         if not handle or not handle.is_valid():
             # Handle invalid / None (already removed from session): drop it now
             # so it doesn't block the drain loop below.
@@ -1083,6 +1126,7 @@ def alert_handle():
                 del TORRENTS[info_hash]
             except KeyError:
                 pass
+            LIVE_HANDLES.discard(info_hash)
             continue
         try:
             if not handle.status().has_metadata:
@@ -1155,9 +1199,12 @@ def main():
     global CONSOLE
     global TRACKERS
     global TORRENTS
+    global LIVE_HANDLES
     global ENGINE
     global REMOTE_STORAGE_ENDPOINT
     global METADATA_QUEUE
+    global MANAGEMENT_DISPATCHER
+    global MANAGEMENT_SERVER
 
     CONSOLE = get_console()
     OPTIONS, args = parse_option()
@@ -1184,6 +1231,44 @@ def main():
 
     # 用 TTL 去重 info_hash，并严格限制 libtorrent session 的 torrent 数量
     TORRENTS = TTLDict(maxsize=MAX_TORRENTS, ttl=TORRENT_TTL)
+    LIVE_HANDLES = LiveHandles(maxsize=MAX_TORRENTS)
+
+    instance_id = os.getenv("MANAGEMENT_INSTANCE_ID", "").strip() or socket.gethostname()
+    management_service = ManagementService(
+        SESSION,
+        LIVE_HANDLES,
+        partial(
+            add_torrent,
+            session=SESSION,
+            registry=TORRENTS,
+            live_handles=LIVE_HANDLES,
+            options=OPTIONS,
+            trackers=TRACKERS,
+        ),
+        instance_id=instance_id,
+        mode="download" if OPTIONS.download_mode else "sniff",
+        pending_registry=TORRENTS,
+    )
+    MANAGEMENT_DISPATCHER = CommandDispatcher(management_service)
+    management_token = os.getenv("MANAGEMENT_TOKEN", "")
+    try:
+        MANAGEMENT_SERVER = start_management_server(
+            OPTIONS.management_host,
+            OPTIONS.management_port,
+            management_token,
+            OPTIONS.management_allow_remote,
+            MANAGEMENT_DISPATCHER,
+        )
+    except ValueError as exc:
+        logging.error("unsafe management configuration: %s", exc)
+        raise SystemExit(2) from exc
+    if MANAGEMENT_SERVER:
+        logging.info(
+            "management API listening on %s:%d",
+            OPTIONS.management_host,
+            OPTIONS.management_port,
+        )
+        atexit.register(MANAGEMENT_SERVER.server_close)
 
     # 持久化可能包含网络和磁盘 I/O，使用有界队列避免阻塞 alert 消费。
     METADATA_QUEUE = queue.Queue(maxsize=METADATA_QUEUE_SIZE)
@@ -1197,9 +1282,13 @@ def main():
     # 启动时如果命令行带了 torrent/magnet，就进入下载模式
     for torrent in args:
         OPTIONS.download_mode = 1
+        management_service.mode = "download"
         add_torrent(torrent)
 
     alert_handle()
+    if MANAGEMENT_SERVER:
+        MANAGEMENT_SERVER.shutdown()
+        MANAGEMENT_SERVER.server_close()
 
 
 if __name__ == '__main__':

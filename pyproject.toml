@@ -18,5 +18,16 @@ dependencies = [
     "wheel==0.45.1"
 ]
 
-[tool.uv]
-dev-dependencies = []
+[project.scripts]
+torrent-client = "app:main"
+torrentctl = "torrentctl:main"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["app", "management", "torrentctl"]
+
+[dependency-groups]
+dev = []
