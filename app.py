@@ -650,7 +650,7 @@ def parse_option():
     )
     parser.add_option(
         '--management-port', type='int',
-        help='management HTTP port; 0 disables it (default: MANAGEMENT_PORT or 0)'
+        help='management HTTP port; 0 disables it (default: MANAGEMENT_PORT or 8080)'
     )
     parser.add_option(
         '--management-allow-remote', action='store_true',
@@ -672,7 +672,7 @@ def parse_option():
         enable_dht=1,
         use_local_storage=0,
         management_host=os.getenv("MANAGEMENT_HOST", "127.0.0.1"),
-        management_port=env_int("MANAGEMENT_PORT", 0),
+        management_port=env_int("MANAGEMENT_PORT", 8080),
         management_allow_remote=False,
     )
 
@@ -1261,6 +1261,9 @@ def main():
         )
     except ValueError as exc:
         logging.error("unsafe management configuration: %s", exc)
+        raise SystemExit(2) from exc
+    except OSError as exc:
+        logging.error("management listener failed: %s", exc)
         raise SystemExit(2) from exc
     if MANAGEMENT_SERVER:
         logging.info(

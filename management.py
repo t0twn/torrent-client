@@ -71,23 +71,78 @@ class LiveHandles:
         return len(self._handles)
 
 
+def _parse_host_value(host_value: str) -> str:
+    """Strip an optional port / bracket from a Host-style value, returning the bare host."""
+    value = (host_value or "").strip()
+    if not value:
+        return ""
+    if value.startswith("["):
+        # IPv6 with brackets: [::1] or [::1]:port
+        close = value.find("]")
+        if close < 0:
+            return value.lstrip("[")
+        return value[1:close]
+    if ":" in value:
+        # Either host:port or a bare IPv6 address; IPv6 literal always has multiple colons.
+        if value.count(":") == 1:
+            return value.rsplit(":", 1)[0]
+        return value
+    return value
+
+
+def _is_loopback_host(host_value: str) -> bool:
+    """Return True when `host_value` is any loopback identifier (127/8, localhost, ::1)."""
+    host = _parse_host_value(host_value)
+    if not host:
+        return False
+    normalized = host.lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def peer_is_loopback(client_address: tuple) -> bool:
+    """True when the TCP peer address is IPv4/IPv6 loopback (incl. IPv4-mapped IPv6)."""
+    if not client_address:
+        return False
+    host = client_address[0]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address):
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            return mapped.is_loopback
+    return addr.is_loopback
+
+
 def validate_management_config(host: str, port: int, token: str, allow_remote: bool) -> None:
     if port == 0:
         return
     if not 1 <= port <= 65535:
         raise ValueError("management port must be between 1 and 65535, or 0 to disable")
-    if not token:
-        raise ValueError("MANAGEMENT_TOKEN is required when management HTTP is enabled")
     try:
-        loopback = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise ValueError(f"invalid management bind address: {host}") from exc
     is_loopback = all(
-        ipaddress.ip_address(info[4][0].split("%")[0]).is_loopback for info in loopback
+        ipaddress.ip_address(info[4][0].split("%")[0]).is_loopback for info in infos
     )
-    if not is_loopback and not allow_remote:
+    if is_loopback:
+        # Loopback listeners are reachable only from the local host. The token is
+        # optional because peer-loopback requests are exempt from bearer auth.
+        return
+    if not allow_remote:
         raise ValueError(
             "non-loopback management bind requires --management-allow-remote"
+        )
+    if not token:
+        raise ValueError(
+            "non-loopback management bind requires a non-empty MANAGEMENT_TOKEN"
         )
 
 
@@ -261,7 +316,7 @@ class _Command:
 class CommandDispatcher:
     """Moves HTTP work onto the alert loop without blocking on client I/O."""
 
-    def __init__(self, service: ManagementService, max_pending: int = 128):
+    def __init__(self, service: Any, max_pending: int = 128):
         self.service = service
         self.commands: queue.Queue[_Command] = queue.Queue(maxsize=max_pending)
 
@@ -333,6 +388,35 @@ class BoundedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             self._slots.release()
 
 
+# Safe loopback origins for browser Origin-header checks. Used only to defend
+# loopback listeners against cross-site browser requests and DNS rebinding.
+_SAFE_LOOPBACK_ORIGINS: frozens[tuple[str, int]] = frozenset({
+    ("127.0.0.1", None),
+    ("127.0.0.1", 8080),
+    ("localhost", None),
+    ("localhost", 8080),
+    ("::1", None),
+    ("::1", 8080),
+    ("[::1]", None),
+    ("[::1]", 8080),
+})
+
+
+def _origin_is_loopback(origin: str) -> bool:
+    """True when the Origin header value identifies a loopback endpoint."""
+    if not origin:
+        return False
+    parsed = urllib.parse.urlsplit(origin)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname or ""
+    if not host:
+        return False
+    # The port is irrelevant to loopback-ness; only the host matters.
+    return _is_loopback_host(host)
+
+
 def make_handler(dispatcher: CommandDispatcher, token: str) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "torrent-client-management/1"
@@ -386,9 +470,47 @@ def make_handler(dispatcher: CommandDispatcher, token: str) -> type[BaseHTTPRequ
             self.end_headers()
             self.wfile.write(body)
 
-        def _authorized(self) -> bool:
+        def _peer_is_loopback(self) -> bool:
+            return peer_is_loopback(getattr(self, "client_address", None))
+
+        def _origin_host_is_safe(self) -> bool:
+            """For loopback-bound listeners: reject cross-site browser requests.
+
+            Browsers send Origin on cross-site requests and on POST; native CLIs
+            do not. Origin (when present) must identify a loopback endpoint, and
+            the Host header must also resolve to a loopback address. This blocks
+            DNS-rebinding attacks where an attacker's domain points to 127.0.0.1.
+
+            Forwarding headers (X-Forwarded-For, Forwarded, X-Real-IP, ...) are
+            intentionally ignored — a reverse proxy that delivers external
+            requests as loopback is the proxy's responsibility to police.
+            """
+            origin = self.headers.get("Origin")
+            if origin:
+                if not _origin_is_loopback(origin):
+                    return False
+            host = self.headers.get("Host", "")
+            if not _is_loopback_host(host):
+                return False
+            return True
+
+        def _authorized(self) -> tuple[bool, str]:
+            """Return (authorized, rejection_reason).
+
+            Authorization is based solely on the TCP peer address. Loopback
+            peers are exempt from bearer auth (a configured token is still
+            accepted, but not required). Non-loopback peers must present the
+            configured bearer token. Host, Origin, X-Forwarded-For, and any
+            other request header are never used to infer local access.
+            """
+            if self._peer_is_loopback():
+                return True, ""
+            if not token:
+                return False, "non-loopback access requires a configured token"
             supplied = self.headers.get("Authorization", "")
-            return hmac.compare_digest(supplied, f"Bearer {token}")
+            if not hmac.compare_digest(supplied, f"Bearer {token}"):
+                return False, "valid bearer token required"
+            return True, ""
 
         def _route(self, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
             path = urllib.parse.urlsplit(self.path).path
@@ -409,8 +531,25 @@ def make_handler(dispatcher: CommandDispatcher, token: str) -> type[BaseHTTPRequ
             raise ManagementError("not_found", "endpoint not found", 404)
 
         def _handle(self) -> None:
-            if not self._authorized():
-                self._send(401, ManagementError("unauthorized", "valid bearer token required", 401).payload())
+            # For loopback peers, apply the same-origin / Host safeguard before
+            # granting the token exemption. Non-loopback peers do not need it
+            # because bearer auth is enforced for them.
+            if self._peer_is_loopback() and not self._origin_host_is_safe():
+                self._send(
+                    403,
+                    ManagementError(
+                        "forbidden_origin",
+                        "request rejected by same-origin safeguard",
+                        403,
+                    ).payload(),
+                )
+                return
+            authorized, reason = self._authorized()
+            if not authorized:
+                self._send(
+                    401,
+                    ManagementError("unauthorized", reason or "unauthorized", 401).payload(),
+                )
                 return
             try:
                 body = None
@@ -453,7 +592,13 @@ def start_management_server(
     validate_management_config(host, port, token, allow_remote)
     if port == 0:
         return None
-    server = BoundedHTTPServer((host, port), make_handler(dispatcher, token))
+    try:
+        server = BoundedHTTPServer((host, port), make_handler(dispatcher, token))
+    except OSError as exc:
+        raise OSError(
+            f"failed to bind management HTTP on {host}:{port}; "
+            "choose a different management port or stop the conflicting listener"
+        ) from exc
     thread = threading.Thread(target=server.serve_forever, name="management-http", daemon=True)
     thread.start()
     return server
@@ -462,16 +607,21 @@ def start_management_server(
 class APIClient:
     def __init__(self, address: str, token: str, timeout: float = 10.0):
         self.address = address.rstrip("/")
-        self.token = token
+        # A missing token is legitimate on loopback listeners. We deliberately
+        # do not fabricate a fake bearer credential in that case.
+        self.token = (token or "").strip()
         self.timeout = timeout
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         data = json.dumps(body).encode() if body is not None else None
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         request = urllib.request.Request(
             f"{self.address}/api/v1{path}",
             data=data,
             method=method,
-            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:

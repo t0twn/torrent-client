@@ -21,55 +21,81 @@ The BitTorrent peer listener is configured by `--listen-interface` and `--port`.
 
 ## Enable management HTTP
 
-Management HTTP is disabled by default (`MANAGEMENT_PORT=0`). Every enabled listener requires a bearer token. The safe local-host setup is:
+The management HTTP listener is enabled on loopback by default: `127.0.0.1:8080`. A single instance started with no configuration is immediately usable from the local CLI (`torrentctl status`, `torrentctl list`, ...) and from any other local process.
+
+To disable the listener entirely, set the port to `0`:
 
 ```console
-export MANAGEMENT_TOKEN='replace-with-a-long-random-secret'
-export MANAGEMENT_PORT=8080
-export MANAGEMENT_INSTANCE_ID='seedbox-east'
+export MANAGEMENT_PORT=0
 uv run torrent-client
 ```
 
-The default management bind is `127.0.0.1`; this remains private even though `docker-compose.yml` uses host networking. `MANAGEMENT_INSTANCE_ID` defaults to the hostname and appears in every successful API response so an external aggregator can distinguish instances.
+For multiple instances on the same host, pick a different management port for each one so the sockets do not collide — a port conflict fails loudly with a hint to choose another management port, it never silently falls back:
+
+```console
+# instance A
+MANAGEMENT_PORT=8080 uv run torrent-client
+
+# instance B
+MANAGEMENT_PORT=8081 uv run torrent-client
+```
+
+The default bind is `127.0.0.1`; this is a loopback address that is only reachable from the host itself (including other processes on the host, and containers that share its network namespace via `network_mode: host`). The BitTorrent peer listener (`--listen-interface` / `--port`) is unrelated — it accepts remote peers from the internet; the management listener does not.
+
+Remote (non-loopback) binds are rejected unless both `--management-allow-remote` and a non-empty `MANAGEMENT_TOKEN` are supplied. The safe way to expose management beyond the host is to leave the loopback listener in place and put an authenticated TLS reverse proxy in front of it. Bearer tokens sent over plain HTTP can be intercepted. Do not reuse the public BitTorrent port or publish the management port directly to the internet.
+
+`MANAGEMENT_INSTANCE_ID` defaults to the hostname and appears in every successful API response so an external aggregator can distinguish instances.
 
 Enabled listeners allow at most 16 active HTTP connections. A request has three seconds to complete its headers and five seconds to complete its POST body; incomplete requests are disconnected, and excess connections are closed. These are absolute deadlines, including clients that send data slowly in small pieces.
-
-A non-loopback bind is rejected unless `--management-allow-remote` is supplied. For access beyond the host, put the loopback listener behind an authenticated TLS reverse proxy whenever possible. Bearer tokens sent over plain HTTP can be intercepted. Do not reuse the public BitTorrent port or publish the management port directly to the internet.
 
 Supported environment settings are:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `MANAGEMENT_HOST` | `127.0.0.1` | HTTP bind address |
-| `MANAGEMENT_PORT` | `0` | HTTP port; zero disables management |
-| `MANAGEMENT_TOKEN` | empty | Required bearer secret when enabled |
+| `MANAGEMENT_HOST` | `127.0.0.1` | HTTP bind address; loopback recommended |
+| `MANAGEMENT_PORT` | `8080` | HTTP port; `0` disables management |
+| `MANAGEMENT_TOKEN` | empty | Bearer secret, optional on loopback, required for non-loopback |
 | `MANAGEMENT_INSTANCE_ID` | hostname | Stable operator-selected instance identity |
 
 ## CLI
 
-`torrentctl` always targets an explicit origin and token, either as flags or environment variables:
+`torrentctl` defaults to `http://127.0.0.1:8080`. The address resolution order is:
+
+1. `--address <origin>`
+2. `TORRENT_CLIENT_ADDRESS`
+3. `http://127.0.0.1:8080`
+
+The token is optional for the default loopback listener and is resolved in the same way:
+
+1. `--token <value>`
+2. `TORRENT_CLIENT_TOKEN`
 
 ```console
-export TORRENT_CLIENT_ADDRESS=http://127.0.0.1:8080
-export TORRENT_CLIENT_TOKEN="$MANAGEMENT_TOKEN"
-
+# default — works against a stock instance with no configuration
 uv run torrentctl status
 uv run torrentctl list
-uv run torrentctl get 0123456789abcdef0123456789abcdef01234567
 uv run torrentctl add 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567'
-uv run torrentctl pause 0123456789abcdef0123456789abcdef01234567
-uv run torrentctl resume all
-uv run torrentctl reannounce all
-uv run torrentctl --json list
+
+# explicit remote endpoint
+uv run torrentctl --address http://seedbox.example:8080 --token "$TOKEN" list
 ```
 
 `all` means every currently valid handle in this process. It is accepted only for pause, resume, and reannounce. Quit remains a local interactive `q` command.
 
 CLI exit codes are stable: `0` success, `2` command-line/configuration error, `3` API error, and `4` connection failure. Human output goes to stdout, JSON output is selected with `--json`, and errors go to stderr. Avoid passing a token directly on shared machines where process arguments are visible; prefer `TORRENT_CLIENT_TOKEN`.
 
+## Security boundaries
+
+Authorization is decided from the actual TCP peer address — the `client_address` of the accepted socket — not from request headers. Loopback peers (IPv4 `127.0.0.0/8`, IPv6 `::1`, and IPv4-mapped IPv6 loopback such as `::ffff:127.0.0.1`) are exempt from bearer authentication regardless of whether `MANAGEMENT_TOKEN` is configured. Non-loopback peers always need the correct bearer token; a missing or incorrect token is rejected with HTTP `401`.
+
+Loopback listeners also enforce a same-origin / Host safeguard against cross-site browser requests and DNS-rebinding attacks: requests whose `Origin` header (when present) or `Host` header identifies a non-loopback endpoint are rejected with HTTP `403`. Native CLI requests (which do not send `Origin`) continue to work unchanged. Forwarding headers such as `X-Forwarded-For`, `Forwarded`, or `X-Real-IP` are deliberately not consulted — when a reverse proxy or tunnel delivers external requests as loopback connections, the proxy is responsible for policing its own access. This safeguard identifies the TCP peer; it does not identify the original client behind a proxy, and claims otherwise should be treated skeptically.
+
+`docker-compose.yml` uses host networking by default, which means the loopback management listener is reachable from the host and from other containers that also use the host network namespace. It is not reachable from bridged containers. Do not re-publish the management port to the internet.
+
+
 ## HTTP API v1
 
-All requests require `Authorization: Bearer <token>` and all bodies are JSON.
+Loopback requests do not require authentication. Non-loopback requests must include `Authorization: Bearer <token>` and are rejected with HTTP `401` when the token is missing or incorrect. All bodies are JSON.
 
 | Method and path | Result |
 | --- | --- |
