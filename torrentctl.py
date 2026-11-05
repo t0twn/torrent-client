@@ -12,15 +12,22 @@ from typing import Any
 from management import APIClient, ManagementError
 
 
+# Address precedence: --address > TORRENT_CLIENT_ADDRESS > http://127.0.0.1:8080.
+_DEFAULT_ADDRESS = "http://127.0.0.1:8080"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="torrentctl", description="Manage one running torrent-client instance")
+    # Address precedence: --address > TORRENT_CLIENT_ADDRESS > http://127.0.0.1:8080.
+    # Resolved lazily in main() so env vars patched after parser construction
+    # are still picked up (important for tests and for wrapper scripts).
     parser.add_argument(
-        "--address", default=os.getenv("TORRENT_CLIENT_ADDRESS"),
-        help="management API origin, e.g. http://127.0.0.1:8080 (or TORRENT_CLIENT_ADDRESS)",
+        "--address", default=None,
+        help="management API origin (default: http://127.0.0.1:8080)",
     )
     parser.add_argument(
-        "--token", default=os.getenv("TORRENT_CLIENT_TOKEN"),
-        help="bearer token (or TORRENT_CLIENT_TOKEN)",
+        "--token", default=None,
+        help="bearer token (or TORRENT_CLIENT_TOKEN); optional for loopback listeners",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -59,7 +66,7 @@ def human_output(command: str, payload: dict[str, Any]) -> str:
         if not torrents:
             return "No live torrents."
         return "\n".join(
-            f"{item['info_hash']}  {item['progress'] * 100:6.2f}%  {item['name']}" for item in torrents
+            f"{item['info_hash']}  {item['progress'] * 100:6.02f}%  {item['name']}" for item in torrents
         )
     if command == "get":
         item = payload["torrent"]
@@ -72,10 +79,11 @@ def human_output(command: str, payload: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.address:
-        parser.error("--address or TORRENT_CLIENT_ADDRESS is required")
-    if not args.token:
-        parser.error("--token or TORRENT_CLIENT_TOKEN is required")
+    # Lazy resolution of defaults so env-var patches are honored.
+    if args.address is None:
+        args.address = os.getenv("TORRENT_CLIENT_ADDRESS", _DEFAULT_ADDRESS)
+    if args.token is None:
+        args.token = os.getenv("TORRENT_CLIENT_TOKEN", "")
     try:
         payload = execute(APIClient(args.address, args.token), args)
     except ManagementError as exc:
