@@ -8,7 +8,7 @@ management API, the `.torrent` cache format, and the session-level
 upload/download rate limits are unchanged.
 
 The scheduler is driven from the alert-loop thread. The only cross-thread
-interaction is a small result queue through which the background
+interaction is a small result dict through which the background
 persistence worker reports success / failure; the alert loop drains it
 between alert batches, so no disk or network work blocks alert
 consumption.
@@ -16,7 +16,7 @@ consumption.
 All in-memory data structures are bounded. Every admission decision
 updates a small, fixed set of counters (``Diagnostics``) that can be
 logged periodically as a single aggregate line. Info-hashes are never
-used as metric labels.
+used as metric labels or included in log messages.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, Optional, Set
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 
 def _env_int(name: str, default: int) -> int:
@@ -55,14 +55,17 @@ def _env_float(name: str, default: float) -> float:
 class CandidateState(enum.Enum):
     """Per-hash scheduler state.
 
-    QUEUED      - admitted, waiting for an in-flight slot
-    IN_FLIGHT   - async_add_torrent submitted, awaiting handle / metadata
-    PERSISTING  - metadata received, background worker writing cache
-    COOLDOWN    - a terminal failure occurred; retry blocked until expiry
+    QUEUED           - admitted, waiting for an in-flight slot
+    IN_FLIGHT        - async_add_torrent submitted, awaiting handle / metadata
+    PENDING_REMOVAL  - acquisition timed out; caller must remove libtorrent
+                       handle; slot is NOT yet released
+    PERSISTING       - metadata received, background worker writing cache
+    COOLDOWN         - a terminal failure occurred; retry blocked until expiry
     """
 
     QUEUED = "queued"
     IN_FLIGHT = "in_flight"
+    PENDING_REMOVAL = "pending_removal"
     PERSISTING = "persisting"
     COOLDOWN = "cooldown"
 
@@ -109,6 +112,9 @@ class SniffSchedulerConfig:
     cooldown_ttl: float = 7200.0
     diagnostics_interval: float = 60.0
     distinct_hash_budget: int = 256
+    max_candidates: int = 2048
+    persist_result_capacity: int = 256
+    queue_drop_cooldown_seconds: float = 30.0
 
     def validate(self) -> None:
         positive = (
@@ -125,6 +131,9 @@ class SniffSchedulerConfig:
             "cooldown_ttl",
             "diagnostics_interval",
             "distinct_hash_budget",
+            "max_candidates",
+            "persist_result_capacity",
+            "queue_drop_cooldown_seconds",
         )
         for name in positive:
             value = getattr(self, name)
@@ -156,6 +165,9 @@ def config_from_environment() -> SniffSchedulerConfig:
         cooldown_ttl=_env_float("SNIFF_COOLDOWN_TTL", 7200.0),
         diagnostics_interval=_env_float("SNIFF_DIAGNOSTICS_INTERVAL", 60.0),
         distinct_hash_budget=_env_int("SNIFF_DISTINCT_HASH_BUDGET", 256),
+        max_candidates=_env_int("SNIFF_MAX_CANDIDATES", 2048),
+        persist_result_capacity=_env_int("SNIFF_PERSIST_RESULT_CAPACITY", 256),
+        queue_drop_cooldown_seconds=_env_float("SNIFF_QUEUE_DROP_COOLDOWN", 30.0),
     )
 
 
@@ -165,9 +177,9 @@ class Diagnostics:
 
     ``recent_hashes`` tracks the set of distinct info-hashes seen since
     the last ``consume`` call, up to ``budget``. If more distinct hashes
-    arrive than fit, ``hash_set_saturated`` is set and the set is a
-    strict lower bound on the true distinct count. ``hash_overflow``
-    records how many distinct hashes were dropped.
+    arrive than fit, ``hash_set_saturated`` is set. ``hash_overflow``
+    counts how many *distinct* hashes arrived beyond the budget (not the
+    number of extra announces of those hashes).
 
     All counters are monotonic non-negative integers; they never decrease
     within a reporting window except via ``consume``, which returns and
@@ -209,25 +221,32 @@ class Diagnostics:
 
     queue_wait_timeouts: int = 0
     queue_evictions: int = 0
+    candidate_evictions: int = 0
 
     cooldown_entries_recorded: int = 0
     cooldown_entries_evicted: int = 0
 
     _recent_hashes: Set[str] = field(default_factory=set, init=False, repr=False)
     _recent_hash_count: int = field(default=0, init=False, repr=False)
+    _overflow_hashes: Set[str] = field(default_factory=set, init=False, repr=False)
 
     def observe_hash(self, info_hash: str) -> None:
         """Record a distinct info-hash in the current window.
 
         If the set is already full and this hash is new, the hash is not
-        inserted, ``hash_overflow`` increments, and ``hash_set_saturated``
-        is set so the periodic log line signals the under-count.
+        inserted, ``hash_overflow`` increments by one for this *distinct*
+        hash (repeat announces of the same overflow hash do not inflate
+        the count), and ``hash_set_saturated`` is set so the periodic log
+        line signals the under-count.
         """
 
         if info_hash in self._recent_hashes:
             return
+        if info_hash in self._overflow_hashes:
+            return
         if len(self._recent_hashes) >= self.budget:
             self.hash_set_saturated = True
+            self._overflow_hashes.add(info_hash)
             self.hash_overflow += 1
             return
         self._recent_hashes.add(info_hash)
@@ -264,18 +283,13 @@ class Diagnostics:
             "persist_queue_full": self.persist_queue_full,
             "queue_wait_timeouts": self.queue_wait_timeouts,
             "queue_evictions": self.queue_evictions,
+            "candidate_evictions": self.candidate_evictions,
             "cooldown_entries_recorded": self.cooldown_entries_recorded,
             "cooldown_entries_evicted": self.cooldown_entries_evicted,
         }
 
     def consume(self) -> Dict[str, Any]:
-        """Return a snapshot and reset the window counters.
-
-        Used by the periodic log emitter. The reset keeps each logged
-        value attributable to the elapsed window. ``hash_set_saturated``
-        and ``hash_overflow`` also reset; the next window starts clean
-        whether or not it saturates.
-        """
+        """Return a snapshot and reset the window counters."""
 
         snapshot = self.snapshot()
         self.announce_peer_received = 0
@@ -284,6 +298,7 @@ class Diagnostics:
         self.hash_set_saturated = False
         self._recent_hashes.clear()
         self._recent_hash_count = 0
+        self._overflow_hashes.clear()
 
         self.skip_cached_file = 0
         self.skip_pending = 0
@@ -313,6 +328,7 @@ class Diagnostics:
 
         self.queue_wait_timeouts = 0
         self.queue_evictions = 0
+        self.candidate_evictions = 0
 
         self.cooldown_entries_recorded = 0
         self.cooldown_entries_evicted = 0
@@ -336,7 +352,9 @@ class CooldownRegistry:
 
     Entries are evicted when the registry reaches capacity (oldest
     insertion first) or when an entry's TTL elapses, whichever comes
-    first.
+    first. The registry also exposes ``evicted_hashes`` after
+    ``record_failure`` / ``_evict_*`` so the scheduler can clean up
+    matching candidate records and keep overall memory bounded.
     """
 
     def __init__(
@@ -350,6 +368,8 @@ class CooldownRegistry:
         self.clock = clock
         self._entries: Dict[str, _CooldownEntry] = {}
         self._order: Deque[str] = deque()
+        self._order_set: Set[str] = set()
+        self.evicted_hashes: List[str] = []
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -364,12 +384,6 @@ class CooldownRegistry:
         return True
 
     def until_allowed(self, info_hash: str) -> Optional[float]:
-        """Return the monotonic time when `info_hash` may retry, or None.
-
-        Returns ``None`` when the hash is not in cooldown or the entry
-        has expired. Caller should compare against its own clock value.
-        """
-
         entry = self._entries.get(info_hash)
         if entry is None:
             return None
@@ -387,21 +401,41 @@ class CooldownRegistry:
             return False
         return entry.next_allowed > now
 
-    def record_failure(self, info_hash: str, now: float) -> None:
-        """Apply exponential backoff with jitter and record a new entry."""
+    def record_failure(
+        self,
+        info_hash: str,
+        now: float,
+        *,
+        override_delay: Optional[float] = None,
+    ) -> None:
+        """Apply exponential backoff with jitter and record a new entry.
 
+        ``evicted_hashes`` is populated with hashes that were removed by
+        expiry or capacity eviction during this call, so the scheduler
+        can clean up their candidate records.
+
+        ``override_delay`` uses a fixed delay instead of computing the
+        backoff; used for bounded overload suppression (queue-drop
+        cooldown) where the normal exponential curve would be too long.
+        """
+
+        self.evicted_hashes = []
         rng = random.Random()
         existing = self._entries.get(info_hash)
-        attempts = (existing.attempts + 1) if existing else 1
 
-        delay = min(
-            self.config.cooldown_base_seconds
-            * (self.config.cooldown_multiplier ** (attempts - 1)),
-            self.config.cooldown_max_seconds,
-        )
-        jitter = delay * self.config.cooldown_jitter
-        delay += rng.uniform(-jitter, jitter)
-        delay = max(0.0, delay)
+        if override_delay is not None:
+            delay = max(0.0, float(override_delay))
+            attempts = (existing.attempts + 1) if existing else 1
+        else:
+            attempts = (existing.attempts + 1) if existing else 1
+            delay = min(
+                self.config.cooldown_base_seconds
+                * (self.config.cooldown_multiplier ** (attempts - 1)),
+                self.config.cooldown_max_seconds,
+            )
+            jitter = delay * self.config.cooldown_jitter
+            delay += rng.uniform(-jitter, jitter)
+            delay = max(0.0, delay)
 
         self._evict_expired(now)
 
@@ -416,7 +450,9 @@ class CooldownRegistry:
             next_allowed=now + delay,
             expires_at=now + self.config.cooldown_ttl,
         )
-        self._order.append(info_hash)
+        if info_hash not in self._order_set:
+            self._order.append(info_hash)
+            self._order_set.add(info_hash)
         self.diagnostics.cooldown_entries_recorded += 1
 
     def clear(self, info_hash: str) -> None:
@@ -440,23 +476,26 @@ class CooldownRegistry:
 
     def _remove(self, info_hash: str) -> None:
         self._entries.pop(info_hash, None)
-        # Lazy deque cleanup: we leave stale markers; they are filtered on
-        # read. The deque is bounded by the registry size plus the number
-        # of past removals, which is itself bounded by record_failure
-        # calls (bounded by capacity * attempts).
+        self._order_set.discard(info_hash)
+        # The deque entry is left in place but filtered on read via _order_set.
 
     def _evict_expired(self, now: float) -> None:
         expired = [h for h, e in self._entries.items() if e.expires_at <= now]
         for h in expired:
             self._entries.pop(h, None)
+            self._order_set.discard(h)
             self.diagnostics.cooldown_entries_evicted += 1
+            self.evicted_hashes.append(h)
 
     def _evict_oldest(self) -> None:
         while self._order:
             candidate = self._order.popleft()
-            if candidate in self._entries:
-                self._entries.pop(candidate, None)
-                self.diagnostics.cooldown_entries_evicted += 1
+            if candidate in self._order_set:
+                self._order_set.discard(candidate)
+                if candidate in self._entries:
+                    self._entries.pop(candidate, None)
+                    self.diagnostics.cooldown_entries_evicted += 1
+                    self.evicted_hashes.append(candidate)
                 return
 
 
@@ -472,11 +511,7 @@ class _Candidate:
 
 
 class PersistResult:
-    """Cross-thread result from the persistence worker.
-
-    The worker enqueues instances of this class; the alert loop drains
-    them into the scheduler.
-    """
+    """Cross-thread result from the persistence worker."""
 
     __slots__ = ("info_hash", "success")
 
@@ -489,20 +524,29 @@ class SniffScheduler:
     """Bounded candidate scheduler for sniff-mode metadata acquisition.
 
     The scheduler is driven entirely from the alert-loop thread, with one
-    exception: ``apply_persist_result`` is safe to call from any thread
-    (it only enqueues into a small bounded deque protected by a lock).
+    exception: ``enqueue_persist_result`` is safe to call from any thread
+    (it writes into a bounded dict protected by a lock).
 
-    Public entry points (alert-loop thread):
+    Lifecycle overview:
 
-    - ``on_announce(info_hash, *, now, cache_exists, session_known)``
-    - ``on_add_started(info_hash, handle, *, now)``
-    - ``on_async_add_failed(info_hash, *, now)``
-    - ``on_metadata_received(info_hash, *, now)``
-    - ``on_metadata_missing(info_hash, *, now)``
-    - ``on_unexpected_handle_removal(info_hash, *, now)``
-    - ``tick(*, now, can_start, cache_exists, session_known)``
-    - ``drain_persist_results(*, now, queue_full)``
-    - ``maybe_emit_diagnostics(*, now)``
+    - ``on_announce`` admits a hash or skips/drops it.
+    - ``on_add_started`` records the handle for a given attempt.
+    - ``on_async_add_failed`` / ``on_invalid_handle_alert`` route a
+      failed add to cooldown.
+    - ``on_metadata_received`` / ``on_metadata_missing`` transition
+      ``IN_FLIGHT`` to ``PERSISTING`` or cooldown.
+    - ``on_persist_queue_full`` treats a full persistence queue as an
+      ``IN_FLIGHT`` terminal failure (slot released, cooldown entered,
+      ``TORRENTS`` reservation cleared by caller).
+    - ``tick`` promotes queued candidates, expires queue waits, and
+      returns timed-out handles for the caller to remove from the
+      libtorrent session. The slot is released only after the caller
+      invokes ``ack_handle_removed``.
+    - ``drain_persist_results`` applies cross-thread results.
+
+    Late alerts (from a previous timed-out handle) are validated against
+    the candidate's stored handle reference so they cannot mutate a new
+    attempt for the same hash.
     """
 
     def __init__(
@@ -520,7 +564,9 @@ class SniffScheduler:
         self._candidates: Dict[str, _Candidate] = {}
         self._queue: Deque[str] = deque()
         self._start_times: Deque[float] = deque()
-        self._persist_results: Deque[PersistResult] = deque()
+        # Latest-writer-wins dict: the worker may report a result before a
+        # duplicate result for the same hash; only the latest matters.
+        self._persist_results: Dict[str, PersistResult] = {}
         self._persist_results_lock = threading.Lock()
         self._generation = 0
         self._last_diagnostics_at: Optional[float] = None
@@ -542,7 +588,8 @@ class SniffScheduler:
 
     def in_flight_count(self) -> int:
         return sum(
-            1 for c in self._candidates.values() if c.state is CandidateState.IN_FLIGHT
+            1 for c in self._candidates.values()
+            if c.state in (CandidateState.IN_FLIGHT, CandidateState.PENDING_REMOVAL)
         )
 
     def persisting_count(self) -> int:
@@ -553,11 +600,20 @@ class SniffScheduler:
     def cooldown_count(self) -> int:
         return len(self.cooldowns)
 
+    def candidate_count(self) -> int:
+        return len(self._candidates)
+
     def handle_for(self, info_hash: str) -> Optional[Any]:
         candidate = self._candidates.get(info_hash)
         if candidate is None or candidate.state is not CandidateState.IN_FLIGHT:
             return None
         return candidate.handle
+
+    def generation_for(self, info_hash: str) -> int:
+        candidate = self._candidates.get(info_hash)
+        if candidate is None:
+            return 0
+        return candidate.handle_generation
 
     # ------------------------------------------------------------------
     # Announce admission
@@ -571,17 +627,12 @@ class SniffScheduler:
         cache_exists: bool = False,
         session_known: bool = False,
     ) -> Admission:
-        """Decide what to do with a freshly parsed `announce_peer`.
-
-        ``cache_exists`` is True when the on-disk `.torrent` file already
-        exists. ``session_known`` is True when ``TORRENTS`` or
-        ``LIVE_HANDLES`` already contains the hash from a non-scheduler
-        path (e.g. management API add, download mode).
-        """
+        """Decide what to do with a freshly parsed `announce_peer`."""
 
         now = self.clock() if now is None else now
         self.diagnostics.announce_peer_received += 1
         self.diagnostics.observe_hash(info_hash)
+        self._sweep_orphan_cooldowns()
 
         if cache_exists:
             self.diagnostics.skip_cached_file += 1
@@ -599,6 +650,9 @@ class SniffScheduler:
             if existing.state is CandidateState.IN_FLIGHT:
                 self.diagnostics.skip_in_flight += 1
                 return Admission.SKIP_IN_FLIGHT
+            if existing.state is CandidateState.PENDING_REMOVAL:
+                self.diagnostics.skip_in_flight += 1
+                return Admission.SKIP_IN_FLIGHT
             if existing.state is CandidateState.PERSISTING:
                 self.diagnostics.skip_persisting += 1
                 return Admission.SKIP_PERSISTING
@@ -606,23 +660,32 @@ class SniffScheduler:
                 if self.cooldowns.is_blocked(info_hash, now):
                     self.diagnostics.skip_cooldown += 1
                     return Admission.SKIP_COOLDOWN
-                # Cooldown expired: reuse the candidate record for a retry.
                 self._clear_candidate(info_hash)
 
         if self.cooldowns.is_blocked(info_hash, now):
             self.diagnostics.skip_cooldown += 1
             return Admission.SKIP_COOLDOWN
 
-        # Attempt to start immediately.
         started = self._try_start(info_hash, now=now)
         if started:
             self.diagnostics.admitted_started += 1
             return Admission.ADMITTED_STARTED
 
-        # Could not start immediately (capacity or rate). Queue if there is
-        # room; otherwise drop. The in-flight bound does not by itself
-        # cause drops; it only defers starting.
         if self._queue_full():
+            self.diagnostics.drop_queue_full += 1
+            # Apply a short cooldown so the same hash doesn't immediately
+            # re-announce and hit the full queue again (bounded overload
+            # suppression). The queue-drop cooldown is deliberately
+            # shorter than acquisition-failure cooldown.
+            self.cooldowns.record_failure(
+                info_hash,
+                now=now,
+                override_delay=self.config.queue_drop_cooldown_seconds,
+            )
+            self._touch_candidate_cooldown(info_hash, now=now)
+            return Admission.DROP_QUEUE_FULL
+
+        if not self._reserve_candidate_slot(info_hash, now=now):
             self.diagnostics.drop_queue_full += 1
             return Admission.DROP_QUEUE_FULL
 
@@ -636,6 +699,25 @@ class SniffScheduler:
 
     def _queue_full(self) -> bool:
         return self.queued_count() >= self.config.max_queue_size
+
+    def _reserve_candidate_slot(self, info_hash: str, now: float) -> bool:
+        """Reserve memory for a new queued candidate.
+
+        Bounded by ``max_candidates``; if we're at capacity, evict an
+        orphan COOLDOWN entry to make room. Returns False only when no
+        eviction candidate exists.
+        """
+
+        if len(self._candidates) < self.config.max_candidates:
+            return True
+        # Try to evict orphan COOLDOWN entries (no cooldown registry entry).
+        for h, c in list(self._candidates.items()):
+            if c.state is CandidateState.COOLDOWN and h not in self.cooldowns:
+                self._candidates.pop(h, None)
+                self.diagnostics.candidate_evictions += 1
+                if len(self._candidates) < self.config.max_candidates:
+                    return True
+        return False
 
     def _rate_limited(self, now: float) -> bool:
         window = self.config.start_rate_window
@@ -660,6 +742,8 @@ class SniffScheduler:
 
         candidate = self._candidates.get(info_hash)
         if candidate is None:
+            if len(self._candidates) >= self.config.max_candidates:
+                return False
             candidate = _Candidate(
                 info_hash=info_hash,
                 state=CandidateState.IN_FLIGHT,
@@ -680,32 +764,48 @@ class SniffScheduler:
     def _clear_candidate(self, info_hash: str) -> None:
         self._candidates.pop(info_hash, None)
 
+    def _touch_candidate_cooldown(self, info_hash: str, *, now: float) -> None:
+        """Create or update a COOLDOWN candidate record for `info_hash`.
+
+        Used when a drop (queue full) applies a short cooldown so the
+        candidate record matches the registry state.
+        """
+
+        existing = self._candidates.get(info_hash)
+        if existing is None:
+            if len(self._candidates) >= self.config.max_candidates:
+                return
+            self._candidates[info_hash] = _Candidate(
+                info_hash=info_hash,
+                state=CandidateState.COOLDOWN,
+                enqueued_at=now,
+            )
+        else:
+            existing.state = CandidateState.COOLDOWN
+            existing.started_at = None
+            existing.handle = None
+            existing.handle_generation = 0
+
     # ------------------------------------------------------------------
     # Lifecycle callbacks (alert-loop thread)
     # ------------------------------------------------------------------
 
-    def on_add_started(self, info_hash: str, handle: Any, *, now: Optional[float] = None) -> None:
+    def on_add_started(
+        self, info_hash: str, handle: Any, *, now: Optional[float] = None
+    ) -> None:
         """Record that libtorrent produced a valid handle for the hash.
 
-        This transitions state to ``IN_FLIGHT`` if the candidate was
-        queued (edge case: a management-API add racing with an announce
-        would not normally pass through the scheduler, so this is mainly
-        defensive). The handle is stamped with a generation number so
-        that late alerts from a previous timed-out handle can be
-        detected and ignored.
+        Validates that the candidate is still in ``IN_FLIGHT``. A late
+        add_torrent_alert for a candidate that has already transitioned
+        (timeout -> pending removal, metadata -> persisting, etc.) is
+        counted as ``late_alert_ignored`` and otherwise dropped.
         """
 
         now = self.clock() if now is None else now
         candidate = self._candidates.get(info_hash)
         if candidate is None:
-            # The hash was added through another path (management API,
-            # download mode). We don't track it; the scheduler only
-            # governs sniff-mode announces.
             return
         if candidate.state is not CandidateState.IN_FLIGHT:
-            # A late add_torrent_alert for a candidate that already
-            # transitioned (timeout -> cooldown, metadata -> persisting,
-            # etc.) must not corrupt the current state.
             self.diagnostics.late_alert_ignored += 1
             return
         self._generation += 1
@@ -713,7 +813,13 @@ class SniffScheduler:
         candidate.handle_generation = self._generation
         candidate.started_at = now
 
-    def on_async_add_failed(self, info_hash: str, *, now: Optional[float] = None) -> None:
+    def on_async_add_failed(
+        self,
+        info_hash: str,
+        *,
+        now: Optional[float] = None,
+        expected_generation: int = 0,
+    ) -> None:
         """Route an invalid-handle ``add_torrent_alert`` to cooldown."""
 
         now = self.clock() if now is None else now
@@ -723,64 +829,70 @@ class SniffScheduler:
         if candidate.state is not CandidateState.IN_FLIGHT:
             self.diagnostics.late_alert_ignored += 1
             return
+        if expected_generation and candidate.handle_generation != expected_generation:
+            self.diagnostics.late_alert_ignored += 1
+            return
         self.diagnostics.add_failed_async += 1
         self._enter_cooldown(info_hash, now=now)
 
-    def on_invalid_handle_alert(self, info_hash: str, *, now: Optional[float] = None) -> None:
-        """Count an add_torrent_alert with an invalid handle.
-
-        Called by the integration layer before ``on_async_add_failed`` so
-        diagnostics can distinguish the two. For scheduler purposes they
-        route the same way.
-        """
+    def on_invalid_handle_alert(
+        self, info_hash: str, *, now: Optional[float] = None
+    ) -> None:
+        """Count an add_torrent_alert with an invalid handle."""
 
         now = self.clock() if now is None else now
         self.diagnostics.invalid_handle_alert += 1
         self.on_async_add_failed(info_hash, now=now)
 
-    def on_sync_add_failure(self, info_hash: str, *, now: Optional[float] = None) -> None:
-        """``async_add_torrent`` was called but ``add_torrent`` raised.
-
-        The caller already released libtorrent-side state; we just enter
-        cooldown.
-        """
+    def on_sync_add_failure(
+        self, info_hash: str, *, now: Optional[float] = None
+    ) -> None:
+        """``async_add_torrent`` was called but ``add_torrent`` raised."""
 
         now = self.clock() if now is None else now
         self.diagnostics.add_failed_sync += 1
         candidate = self._candidates.get(info_hash)
         if candidate is None or candidate.state is not CandidateState.IN_FLIGHT:
-            # We never reserved this hash in the scheduler (another path
-            # called add_torrent); nothing to release.
             return
         self._enter_cooldown(info_hash, now=now)
 
-    def on_metadata_received(self, info_hash: str, *, now: Optional[float] = None) -> bool:
-        """Transition to PERSISTING. Returns True when the scheduler owns the hash.
+    def on_metadata_received(
+        self,
+        info_hash: str,
+        handle: Any = None,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Transition to PERSISTING.
 
-        Returning False tells the caller that the scheduler did not own
-        this hash; the caller should still remove the handle from the
-        libtorrent session but must not wait for a persist result.
+        When ``handle`` is supplied, it must match the candidate's
+        recorded handle (by identity); otherwise the alert is treated as
+        stale and counted in ``late_alert_ignored``. Returns True when
+        the scheduler owns the hash and transitioned it to PERSISTING.
         """
 
         now = self.clock() if now is None else now
         candidate = self._candidates.get(info_hash)
         if candidate is None:
-            # Untracked hash (added through management API or download
-            # mode). Nothing for the scheduler to do.
             return False
         if candidate.state is not CandidateState.IN_FLIGHT:
-            # Late alert for a candidate that already moved on.
+            self.diagnostics.late_alert_ignored += 1
+            return False
+        if handle is not None and candidate.handle is not None and candidate.handle is not handle:
+            # Old handle from a previous attempt that has already timed
+            # out (and whose removal has been acked) must not transition
+            # the new attempt to PERSISTING.
             self.diagnostics.late_alert_ignored += 1
             return False
         candidate.state = CandidateState.PERSISTING
-        # Clear the handle reference so timeout cannot yank it out from
-        # under the persistence worker.
         candidate.handle = None
         candidate.handle_generation = 0
         self.diagnostics.metadata_success += 1
         return True
 
-    def on_metadata_missing(self, info_hash: str, *, now: Optional[float] = None) -> bool:
+    def on_metadata_missing(
+        self, info_hash: str, *, now: Optional[float] = None
+    ) -> bool:
         """metadata_received fired but ``torrent_file`` was None."""
 
         now = self.clock() if now is None else now
@@ -804,74 +916,83 @@ class SniffScheduler:
         if candidate is None:
             return
         if candidate.state is CandidateState.PERSISTING:
-            # A persistence job is still outstanding; do not touch state.
             return
         if candidate.state is CandidateState.IN_FLIGHT:
             self._enter_cooldown(info_hash, now=now)
+
+    def on_persist_queue_full(
+        self, info_hash: str, *, now: Optional[float] = None
+    ) -> bool:
+        """The metadata queue rejected a new persistence job.
+
+        Treats queue-full as an ``IN_FLIGHT`` terminal failure: slot
+        released, cooldown entered, and ``True`` is returned so the
+        caller can also release any ``TORRENTS`` reservation it made on
+        the candidate's behalf. Also accepts the case where the
+        candidate is already ``PERSISTING`` (a previous queueing attempt
+        succeeded but we still want to register the overflow).
+        """
+
+        now = self.clock() if now is None else now
+        self.diagnostics.persist_queue_full += 1
+        candidate = self._candidates.get(info_hash)
+        if candidate is None:
+            return False
+        if candidate.state not in (
+            CandidateState.IN_FLIGHT,
+            CandidateState.PERSISTING,
+        ):
+            return False
+        self._enter_cooldown(info_hash, now=now)
+        return True
 
     # ------------------------------------------------------------------
     # Persistence result boundary
     # ------------------------------------------------------------------
 
     def enqueue_persist_result(self, info_hash: str, success: bool) -> None:
-        """Thread-safe: called from the background persistence worker."""
+        """Thread-safe: called from the background persistence worker.
+
+        Uses a dict keyed by info_hash so duplicate or reordered results
+        for the same hash collapse to the latest, rather than being
+        dropped. Bounded by ``persist_result_capacity``; when full, the
+        oldest (by insertion order) entry is removed to make room.
+        """
 
         result = PersistResult(info_hash, success)
         with self._persist_results_lock:
-            self._persist_results.append(result)
-            # Bound memory: drop oldest if the alert loop has stalled.
-            bound = max(self.config.max_queue_size, 4)
-            while len(self._persist_results) > bound:
-                self._persist_results.popleft()
+            if (
+                info_hash not in self._persist_results
+                and len(self._persist_results) >= self.config.persist_result_capacity
+            ):
+                # Drop the oldest entry. dict preserves insertion order.
+                oldest = next(iter(self._persist_results))
+                del self._persist_results[oldest]
+            self._persist_results[info_hash] = result
 
     def drain_persist_results(
         self,
         *,
         now: Optional[float] = None,
-        queue_full: Optional[Callable[[str], bool]] = None,
     ) -> None:
-        """Apply pending persist results on the alert-loop thread.
-
-        ``queue_full`` is a callable that returns True when the
-        background persistence queue cannot accept more work. The
-        scheduler uses it to decide whether to enter cooldown when a
-        result reports failure because the queue was full.
-        """
+        """Apply pending persist results on the alert-loop thread."""
 
         now = self.clock() if now is None else now
         with self._persist_results_lock:
-            results = list(self._persist_results)
+            results = list(self._persist_results.items())
             self._persist_results.clear()
 
-        for result in results:
-            candidate = self._candidates.get(result.info_hash)
+        for info_hash, result in results:
+            candidate = self._candidates.get(info_hash)
             if candidate is None or candidate.state is not CandidateState.PERSISTING:
-                # Stale result for a hash we already moved on from.
                 continue
             if result.success:
                 self.diagnostics.persist_success += 1
-                self.cooldowns.clear(result.info_hash)
-                self._clear_candidate(result.info_hash)
+                self.cooldowns.clear(info_hash)
+                self._clear_candidate(info_hash)
             else:
                 self.diagnostics.persist_failure += 1
-                self._enter_cooldown(result.info_hash, now=now)
-
-    def note_persist_queue_full(
-        self, info_hash: str, *, now: Optional[float] = None
-    ) -> None:
-        """The metadata queue rejected a new persistence job.
-
-        Called from the alert-loop thread when ``METADATA_QUEUE`` raises
-        ``queue.Full``. We still own the candidate; enter cooldown so we
-        do not loop on the same hash.
-        """
-
-        now = self.clock() if now is None else now
-        self.diagnostics.persist_queue_full += 1
-        candidate = self._candidates.get(info_hash)
-        if candidate is None or candidate.state is not CandidateState.PERSISTING:
-            return
-        self._enter_cooldown(info_hash, now=now)
+                self._enter_cooldown(info_hash, now=now)
 
     # ------------------------------------------------------------------
     # Periodic maintenance
@@ -884,41 +1005,69 @@ class SniffScheduler:
         can_start: Optional[Callable[[str], bool]] = None,
         cache_exists: Optional[Callable[[str], bool]] = None,
         session_known: Optional[Callable[[str], bool]] = None,
-    ) -> list:
+    ) -> Tuple[List[str], List[Tuple[str, Any]]]:
         """Advance timeouts, evictions, and queued promotions.
 
-        ``can_start`` is invoked with an info_hash before promoting it
-        from the queue; return False to leave it queued. ``cache_exists``
-        and ``session_known`` are consulted so a hash whose cache file
-        arrived or that was added externally is silently dropped.
+        Returns a pair ``(promoted, pending_removals)``:
 
-        Returns the list of info-hashes that were promoted from QUEUED
-        to IN_FLIGHT during this tick. The caller must invoke
-        ``add_torrent`` for each of them and, if ``add_torrent`` returns
-        False or raises, call ``on_sync_add_failure`` to release the
-        scheduler slot.
+        - ``promoted`` is the list of info-hashes that were moved from
+          QUEUED to IN_FLIGHT during this tick. The caller must invoke
+          ``add_torrent`` for each of them and, if it fails, call
+          ``on_sync_add_failure``.
+        - ``pending_removals`` is the list of ``(info_hash, handle)``
+          pairs whose acquisition has exceeded the timeout. The caller
+          must remove each handle from the libtorrent session (and from
+          ``LIVE_HANDLES`` / ``TORRENTS``) and then invoke
+          ``ack_handle_removed`` to release the scheduler slot.
         """
 
         now = self.clock() if now is None else now
-        self._expire_timeouts(now)
-        self._expire_queue_waits(now, cache_exists=cache_exists, session_known=session_known)
-        return self._promote_queued(
+        self._sweep_orphan_cooldowns()
+        self._expire_queue_waits(
+            now, cache_exists=cache_exists, session_known=session_known
+        )
+        pending = self._collect_pending_removals(now)
+        promoted = self._promote_queued(
             now=now,
             can_start=can_start,
             cache_exists=cache_exists,
             session_known=session_known,
         )
+        return promoted, pending
 
-    def _expire_timeouts(self, now: float) -> None:
+    def pending_removals(self, now: Optional[float] = None) -> List[Tuple[str, Any]]:
+        """Return timed-out candidates without changing their state."""
+
+        now = self.clock() if now is None else now
+        return self._collect_pending_removals(now)
+
+    def _collect_pending_removals(self, now: float) -> List[Tuple[str, Any]]:
         timeout = self.config.acquisition_timeout
-        for info_hash, candidate in list(self._candidates.items()):
+        result: List[Tuple[str, Any]] = []
+        for candidate in self._candidates.values():
             if candidate.state is not CandidateState.IN_FLIGHT:
                 continue
-            if candidate.started_at is None:
+            if candidate.handle is None or candidate.started_at is None:
                 continue
             if now - candidate.started_at >= timeout:
+                candidate.state = CandidateState.PENDING_REMOVAL
+                result.append((candidate.info_hash, candidate.handle))
                 self.diagnostics.metadata_timeout += 1
-                self._enter_cooldown(info_hash, now=now, cancel_handle=True)
+        return result
+
+    def ack_handle_removed(self, info_hash: str, *, now: Optional[float] = None) -> None:
+        """Caller has removed the libtorrent handle for a timed-out hash.
+
+        Transitions the candidate to COOLDOWN and releases the slot.
+        """
+
+        now = self.clock() if now is None else now
+        candidate = self._candidates.get(info_hash)
+        if candidate is None:
+            return
+        if candidate.state is not CandidateState.PENDING_REMOVAL:
+            return
+        self._enter_cooldown(info_hash, now=now, skip_record=True)
 
     def _expire_queue_waits(
         self,
@@ -987,45 +1136,47 @@ class SniffScheduler:
     # Internals
     # ------------------------------------------------------------------
 
+    def _sweep_orphan_cooldowns(self) -> None:
+        """Remove COOLDOWN candidates whose registry entry is gone.
+
+        Called at the start of on_announce and tick so memory stays
+        bounded even when the cooldown registry evicts entries.
+        """
+
+        if not self._candidates:
+            return
+        for h in list(self._candidates):
+            c = self._candidates[h]
+            if c.state is CandidateState.COOLDOWN and h not in self.cooldowns:
+                self._candidates.pop(h, None)
+                self.diagnostics.candidate_evictions += 1
+
     def _enter_cooldown(
-        self, info_hash: str, *, now: float, cancel_handle: bool = False
+        self,
+        info_hash: str,
+        *,
+        now: float,
+        cancel_handle: bool = False,
+        skip_record: bool = False,
     ) -> None:
         candidate = self._candidates.get(info_hash)
         if cancel_handle and candidate is not None and candidate.handle is not None:
-            # Surface the handle to the caller via a marker; the actual
-            # session.remove_torrent is the caller's responsibility
-            # because we don't hold a reference to the libtorrent session.
             candidate.handle = None
             candidate.handle_generation = 0
-        self.cooldowns.record_failure(info_hash, now)
+        if not skip_record:
+            self.cooldowns.record_failure(info_hash, now)
         if candidate is not None:
             candidate.state = CandidateState.COOLDOWN
             candidate.started_at = None
+            candidate.handle = None
+            candidate.handle_generation = 0
         else:
-            self._candidates[info_hash] = _Candidate(
-                info_hash=info_hash,
-                state=CandidateState.COOLDOWN,
-                enqueued_at=now,
-            )
-
-    def timed_out_handles(self, now: float) -> list:
-        """Return handles whose acquisition has exceeded the timeout.
-
-        The alert-loop caller uses this to remove the matching
-        libtorrent handles from the session, ensuring the concurrency
-        bound reflects actual active acquisitions.
-        """
-
-        handles = []
-        timeout = self.config.acquisition_timeout
-        for candidate in self._candidates.values():
-            if candidate.state is not CandidateState.IN_FLIGHT:
-                continue
-            if candidate.handle is None or candidate.started_at is None:
-                continue
-            if now - candidate.started_at >= timeout:
-                handles.append(candidate.handle)
-        return handles
+            if len(self._candidates) < self.config.max_candidates:
+                self._candidates[info_hash] = _Candidate(
+                    info_hash=info_hash,
+                    state=CandidateState.COOLDOWN,
+                    enqueued_at=now,
+                )
 
     def maybe_emit_diagnostics(
         self,
@@ -1033,12 +1184,7 @@ class SniffScheduler:
         now: Optional[float] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Log an aggregate snapshot at ``diagnostics_interval`` cadence.
-
-        Returns the snapshot when one was emitted so tests can assert on
-        the content without parsing log lines. ``logger`` defaults to
-        ``logging.info``; tests can pass a capture.
-        """
+        """Log an aggregate snapshot at ``diagnostics_interval`` cadence."""
 
         now = self.clock() if now is None else now
         if self._last_diagnostics_at is None:
@@ -1052,6 +1198,7 @@ class SniffScheduler:
         snapshot["in_flight"] = self.in_flight_count()
         snapshot["persisting"] = self.persisting_count()
         snapshot["cooldowns"] = self.cooldown_count()
+        snapshot["candidates"] = self.candidate_count()
 
         log = logger if logger is not None else logging.info
         parts = [f"{k}={v}" for k, v in snapshot.items()]

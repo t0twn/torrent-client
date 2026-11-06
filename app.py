@@ -918,18 +918,27 @@ def handle_alert_metadata_received(a):
         except queue.Full:
             logging.warning("metadata queue full, dropping torrent: %s", info_hash)
 
+    scheduler_entered_cooldown = False
     if scheduler is not None and info_hash is not None:
         if queued:
-            # The scheduler now waits for the persistence worker's result.
-            scheduler.on_metadata_received(info_hash)
+            # Pass the handle so the scheduler can validate it against
+            # the in-flight candidate's recorded handle. A stale alert
+            # from a previous timed-out attempt is rejected here.
+            scheduler.on_metadata_received(info_hash, handle=handle)
         else:
-            # Queue was full or TORRENTS full; the scheduler's slot stays
-            # reserved until the worker would have reported. We release
-            # it via note_persist_queue_full so the hash can cool down.
-            scheduler.note_persist_queue_full(info_hash)
+            # Queue was full or TORRENTS full. The scheduler treats this
+            # as an IN_FLIGHT terminal failure: slot released, cooldown
+            # entered. We must also clear the TORRENTS reservation we
+            # just created so the hash can be retried after cooldown.
+            if scheduler.on_persist_queue_full(info_hash):
+                scheduler_entered_cooldown = True
+                try:
+                    del TORRENTS[info_hash]
+                except KeyError:
+                    pass
 
     # Keep a TTL reservation while the background worker persists this hash.
-    if not queued:
+    if not queued or scheduler_entered_cooldown:
         _teardown_metadata_handle(handle, info_hash)
     else:
         SESSION.remove_torrent(handle)
@@ -1027,12 +1036,12 @@ def handle_alert_announce_peer(a):
     if scheduler is None:
         # Scheduler disabled (shouldn't happen in sniff mode, but be defensive).
         if cache_exists:
-            logging.debug("torrent local detected: %s skip", info_hash)
+            logging.debug("torrent local detected: skip")
             return
         if session_known:
-            logging.debug("torrent running detected: %s skip", info_hash)
+            logging.debug("torrent running detected: skip")
             return
-        logging.info("torrent detected: %s", info_hash)
+        logging.debug("torrent admitted (no scheduler)")
         add_torrent(info_hash)
         return
 
@@ -1047,23 +1056,23 @@ def handle_alert_announce_peer(a):
         return
 
     if admission is Admission.ADMITTED_QUEUED:
-        logging.debug("torrent queued: %s", info_hash)
+        logging.debug("torrent queued for later start")
         return
 
     if admission is Admission.SKIP_CACHED:
-        logging.debug("torrent local detected: %s skip", info_hash)
+        logging.debug("torrent local detected: skip")
     elif admission is Admission.SKIP_KNOWN_TO_SESSION:
-        logging.debug("torrent running detected: %s skip", info_hash)
+        logging.debug("torrent running detected: skip")
     elif admission is Admission.SKIP_IN_FLIGHT:
-        logging.debug("torrent in-flight: %s skip", info_hash)
+        logging.debug("torrent in-flight: skip")
     elif admission is Admission.SKIP_PENDING:
-        logging.debug("torrent pending: %s skip", info_hash)
+        logging.debug("torrent pending: skip")
     elif admission is Admission.SKIP_PERSISTING:
-        logging.debug("torrent persisting: %s skip", info_hash)
+        logging.debug("torrent persisting: skip")
     elif admission is Admission.SKIP_COOLDOWN:
-        logging.debug("torrent cooldown: %s skip", info_hash)
+        logging.debug("torrent cooldown: skip")
     elif admission is Admission.DROP_QUEUE_FULL:
-        logging.debug("torrent queue full: %s drop", info_hash)
+        logging.debug("torrent queue full: drop")
 
 
 def _start_sniff_acquisition(info_hash):
@@ -1074,7 +1083,7 @@ def _start_sniff_acquisition(info_hash):
     them in the normal way.
     """
 
-    logging.info("torrent detected: %s", info_hash)
+    logging.debug("starting sniff acquisition")
     try:
         accepted = add_torrent(info_hash)
     except Exception:
@@ -1229,6 +1238,14 @@ def _drive_sniff_scheduler(now):
 
     Called once per alert-loop iteration. When the scheduler is not
     initialised (download mode) this is a no-op.
+
+    Timeout removal uses a two-phase protocol so the scheduler's slot
+    bound reflects actual active acquisitions: ``tick`` returns handles
+    whose acquisition has exceeded the timeout but does not release the
+    slot; the caller removes each handle from the libtorrent session and
+    tracking maps, then ``ack_handle_removed`` releases the slot. This
+    prevents a stale handle from continuing to consume a slot after the
+    scheduler has moved on.
     """
 
     scheduler = SNIFF_SCHEDULER
@@ -1245,7 +1262,7 @@ def _drive_sniff_scheduler(now):
             LIVE_HANDLES is not None and info_hash in LIVE_HANDLES
         )
 
-    promoted = scheduler.tick(
+    promoted, pending_removals = scheduler.tick(
         now=now,
         cache_exists=_cache_exists,
         session_known=_session_known,
@@ -1253,13 +1270,21 @@ def _drive_sniff_scheduler(now):
     for info_hash in promoted:
         _start_sniff_acquisition(info_hash)
 
-    # Remove libtorrent handles whose acquisition exceeded the timeout.
-    for handle in scheduler.timed_out_handles(now):
+    # Two-phase timeout removal: remove the handle from the session and
+    # tracking maps, then ack to the scheduler so it can release the slot.
+    for info_hash, handle in pending_removals:
         try:
             if handle is not None and handle.is_valid():
                 SESSION.remove_torrent(handle)
-        except Exception:
+        except Exception as e:
+            logging.warning("failed to remove timed-out handle %s: %s", info_hash, e)
+        try:
+            del TORRENTS[info_hash]
+        except KeyError:
             pass
+        if LIVE_HANDLES is not None:
+            LIVE_HANDLES.discard(info_hash)
+        scheduler.ack_handle_removed(info_hash, now=now)
 
     scheduler.maybe_emit_diagnostics(now=now)
 

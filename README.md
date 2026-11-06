@@ -81,6 +81,9 @@ Supported scheduler environment settings:
 | `SNIFF_COOLDOWN_TTL` | `7200.0` | Seconds before a cooldown entry expires |
 | `SNIFF_DIAGNOSTICS_INTERVAL` | `60.0` | Seconds between aggregate log lines |
 | `SNIFF_DISTINCT_HASH_BUDGET` | `256` | Distinct hash tracking budget per diagnostics window |
+| `SNIFF_MAX_CANDIDATES` | `2048` | Total cap on scheduler candidate records (queued + in-flight + cooldown) |
+| `SNIFF_PERSIST_RESULT_CAPACITY` | `256` | Max outstanding persistence results held before oldest-wins eviction |
+| `SNIFF_QUEUE_DROP_COOLDOWN` | `30.0` | Seconds of bounded overload suppression after a queue-full drop |
 
 All values must be positive. Invalid values fail fast at startup with a clear error message.
 
@@ -102,9 +105,9 @@ sniff-scheduler announce_peer_received=142 announce_peer_invalid=0
   queued=0 in_flight=3 persisting=1 cooldowns=2
 ```
 
-Info-hashes are never logged or labelled individually. `distinct_hashes` is a lower bound once `hash_set_saturated` becomes `true` within a window; `hash_overflow` counts how many hashes fell outside the tracking budget.
+Info-hashes are never logged or labelled individually. All scheduler logging in the sniff path is hash-agnostic; the periodic `sniff-scheduler` line is the only operator-facing output for this subsystem. `distinct_hashes` is a lower bound once `hash_set_saturated` becomes `true` within a window; `hash_overflow` counts how many **distinct** hashes arrived beyond the tracking budget (repeat announces of an overflow hash do not inflate the count within the same window).
 
-`announce_peer_received` counts valid DHT `announce_peer` messages after decode; `announce_peer_invalid` counts packets that failed decode or were not `announce_peer` queries. The scheduler's skip / drop counters cover every non-admitted announce; the sum of all skip, drop, admitted, and duplicate (`skip_in_flight`, `skip_pending`, `skip_persisting`, `skip_known_to_session`) equals `announce_peer_received` minus `announce_peer_invalid` minus `skip_cached_file`.
+`announce_peer_received` counts valid DHT `announce_peer` messages after decode and info-hash extraction. `announce_peer_invalid` counts only packets that failed decode or whose info-hash field was missing/unparsable; well-formed DHT queries that are not `announce_peer` are silently ignored (they are normal DHT traffic, not announces). The scheduler's skip / drop counters cover every non-admitted announce; the sum of all skip, drop, and admitted counters equals `announce_peer_received` minus `announce_peer_invalid` minus `skip_cached_file`.
 
 ### Baseline procedure
 
@@ -113,29 +116,34 @@ These counters are the supported way to attribute sniff-mode load. To measure a 
 1. Start the process in sniff mode with the default configuration.
 2. Let it run for at least `SNIFF_DIAGNOSTICS_INTERVAL` seconds.
 3. Collect consecutive `sniff-scheduler` log lines.
-4. Compare `admitted_started` (new metadata acquisitions the scheduler launched) against the host or container RX/TX bytes from `ss`, `ip -s link`, or cgroup counters over the same window. Do **not** treat `announce_peer_received` as network bytes; it counts DHT query messages observed by libtorrent's alert path, not total NIC traffic. DHT and metadata/peer traffic are distinct: `announce_peer_received` is DHT load; `admitted_started` is metadata acquisition load; neither is the host's total byte count.
+4. Compare `admitted_started` (new metadata acquisitions the scheduler launched) against the host or container RX/TX bytes from `ss`, `ip -s link`, or cgroup counters over the same window. Do **not** treat `announce_peer_received` as network bytes; it counts DHT query messages observed by libtorrent's alert path, not total NIC traffic. The scheduler does not measure DHT byte volume; DHT and metadata/peer traffic are distinct. `announce_peer_received` is a message count; `admitted_started` is a metadata-acquisition count; neither is the host's total byte count.
 5. If a specific host/container network cap is required, enforce it at the deployment layer (cgroup, iptables, orchestrator limit). The scheduler does not measure or enforce total NIC bytes.
 
-Report any measured baseline only if actually measured; otherwise document that the production cause of high traffic remains unproven and reproduce with the diagnostic counters above.
+Report any measured baseline only if actually measured; otherwise document that the production cause of high traffic remains unproven and reproduce with the diagnostic counters above. **No production traffic measurement was performed as part of this PR**; the counters and baseline procedure are the mechanism by which an operator can measure their own deployment.
 
 ### Throughput tradeoffs
 
 - Lower `SNIFF_MAX_IN_FLIGHT` reduces concurrent metadata traffic but increases queue wait time and the chance of `queue_wait_timeouts`.
 - Higher `SNIFF_MAX_STARTS_PER_SECOND` admits bursts at the cost of more simultaneous metadata connections.
 - Shorter `SNIFF_ACQUISITION_TIMEOUT` frees slots faster but may abort acquisitions that would have succeeded on a slower network.
-- The retry policy for overload drops (queue full) is identical to failed acquisition: the hash enters the same cooldown registry with the same backoff.
+- Overload drops (queue full) apply a short bounded cooldown (`SNIFF_QUEUE_DROP_COOLDOWN`, default 30 s) so the same hash does not immediately re-announce and hit the full queue again. This is deliberately shorter than the acquisition-failure cooldown; repeated drops for the same hash compound via the normal backoff curve on subsequent failures.
 
 ### Restart and cache cleanup
 
 The scheduler's queue, in-flight set, and cooldown registry are in-memory only. A process restart clears them. The authoritative durable signal is the `.torrent` cache file in `TORRENT_DIR`: any hash whose cache file exists is skipped before the scheduler is consulted, even across restarts. Daily cache cleanup (`cleanup_old_cache_files`, default 7 days) removes files older than the configured threshold; hashes whose cache was deleted become eligible for reacquisition, subject to the usual scheduler bounds.
 
-### Future budget accounting
+### Hourly / daily budget policy
 
-Strict host/container network caps need deployment-level counters and enforcement. A proposed extension path:
+The scheduler does not enforce a byte budget itself; the counters above provide the inputs an operator needs to enforce one at the deployment layer. A concrete policy proposal for a future extension:
 
-- Ingress / egress measurement point: cgroup or orchestrator counters, not application-level torrent bytes.
-- In-flight tasks at restart: the scheduler does not resume in-flight state; hashes whose cache was not persisted before restart are reacquired on the next announce.
-- Overage logging: a future extension could read the deployment counters and log when a rolling window exceeds a configured budget; the scheduler itself does not poll network counters.
+- **Measurement point.** Use cgroup v2 `io.stat` / `memory.current` or orchestrator pod counters for the process; `ip -s link` for the host NIC. Do not derive bytes from `announce_peer_received` or `admitted_started`.
+- **Window.** Rolling 1-hour and 24-hour windows evaluated in the alert loop's diagnostics tick. The scheduler records `admitted_started` per window; the deployment layer records bytes per window.
+- **Stopping new starts.** When the rolling window exceeds the configured budget, a future flag could set `SNIFF_MAX_STARTS_PER_SECOND=0` and let in-flight acquisitions finish naturally. In-flight tasks at that point are **not** aborted: they complete normally and their results are still persisted.
+- **Restart continuity.** Budget counters are not durable. After restart, the window resets. The `.torrent` cache continues to suppress reacquisition of cached hashes regardless of budget.
+- **Overage recording.** Each window that exceeds its budget emits a one-line `sniff-budget` log with the measured value, the limit, and the window length. No automatic enforcement occurs in this release.
+- **No production baseline.** This policy is unvalidated against production traffic. Operators should measure with the `sniff-scheduler` counters and host RX/TX counters for at least 24 hours before setting limits.
+
+This is explicitly a future extension; the current release provides only the observation surface. A strict host/container network cap needs deployment-level counters and enforcement.
 
 ## CLI
 

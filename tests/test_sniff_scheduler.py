@@ -436,7 +436,7 @@ class SchedulerLifecycleTests(unittest.TestCase):
         scheduler.on_announce(HASH_A, now=clock())
         scheduler.on_metadata_received(HASH_A, now=clock())
 
-        scheduler.note_persist_queue_full(HASH_A, now=clock())
+        scheduler.on_persist_queue_full(HASH_A, now=clock())
 
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
         self.assertEqual(scheduler.diagnostics.persist_queue_full, 1)
@@ -477,27 +477,35 @@ class SchedulerLifecycleTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class SchedulerTimeoutAndPromotionTests(unittest.TestCase):
-    def test_acquisition_timeout_enters_cooldown(self):
+    def test_acquisition_timeout_enters_cooldown_after_ack(self):
         scheduler, clock = make_scheduler(acquisition_timeout=10.0)
 
         scheduler.on_announce(HASH_A, now=clock())
+        handle = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle, now=clock())
         clock.advance(11.0)
-        scheduler.tick(now=clock())
+        promoted, pending = scheduler.tick(now=clock())
 
-        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+        self.assertEqual(pending, [(HASH_A, handle)])
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PENDING_REMOVAL)
         self.assertEqual(scheduler.diagnostics.metadata_timeout, 1)
+        # Slot stays occupied until caller removes the handle and acks.
+        self.assertEqual(scheduler.in_flight_count(), 1)
+        scheduler.ack_handle_removed(HASH_A, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
         self.assertEqual(scheduler.in_flight_count(), 0)
 
-    def test_timed_out_handles_returns_handles_to_remove(self):
+    def test_pending_removals_returns_handles_without_transition(self):
         scheduler, clock = make_scheduler(acquisition_timeout=10.0)
         scheduler.on_announce(HASH_A, now=clock())
         handle = SimpleNamespace(is_valid=lambda: True)
         scheduler.on_add_started(HASH_A, handle, now=clock())
         clock.advance(11.0)
 
-        handles = scheduler.timed_out_handles(clock())
+        pending = scheduler.pending_removals(clock())
 
-        self.assertEqual(handles, [handle])
+        self.assertEqual(pending, [(HASH_A, handle)])
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PENDING_REMOVAL)
 
     def test_queue_promotion_when_slot_opens(self):
         scheduler, clock = make_scheduler(max_concurrent_acquisitions=1)
@@ -507,7 +515,7 @@ class SchedulerTimeoutAndPromotionTests(unittest.TestCase):
         self.assertEqual(scheduler.queued_count(), 1)
 
         scheduler.on_metadata_received(HASH_A, now=clock())  # slot opens
-        promoted = scheduler.tick(now=clock())
+        promoted, _ = scheduler.tick(now=clock())
 
         self.assertEqual(promoted, [HASH_B])
         self.assertEqual(scheduler.state_of(HASH_B), ss.CandidateState.IN_FLIGHT)
@@ -519,7 +527,7 @@ class SchedulerTimeoutAndPromotionTests(unittest.TestCase):
         scheduler.on_announce(HASH_B, now=clock())  # queued
 
         scheduler.on_metadata_received(HASH_A, now=clock())
-        promoted = scheduler.tick(
+        promoted, _ = scheduler.tick(
             now=clock(),
             cache_exists=lambda h: h == HASH_B,
         )
@@ -550,8 +558,12 @@ class SchedulerTimeoutAndPromotionTests(unittest.TestCase):
 
         # First acquisition times out.
         scheduler.on_announce(HASH_A, now=clock())
+        handle_old = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle_old, now=clock())
         clock.advance(11.0)
-        scheduler.tick(now=clock())
+        _, pending = scheduler.tick(now=clock())
+        self.assertEqual(len(pending), 1)
+        scheduler.ack_handle_removed(HASH_A, now=clock())
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
 
         # Wait for cooldown to expire, then a second announce starts a new acquisition.
@@ -583,14 +595,18 @@ class SchedulerTimeoutAndPromotionTests(unittest.TestCase):
         self.assertEqual(second, ss.Admission.ADMITTED_QUEUED)
 
         clock.advance(1.1)
-        promoted = scheduler.tick(now=clock())
+        promoted, _ = scheduler.tick(now=clock())
         self.assertEqual(promoted, [HASH_B])
 
     def test_late_add_alert_after_timeout_does_not_corrupt_reservation(self):
         scheduler, clock = make_scheduler(acquisition_timeout=5.0)
         scheduler.on_announce(HASH_A, now=clock())
+        handle_old = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle_old, now=clock())
         clock.advance(6.0)
-        scheduler.tick(now=clock())  # timeout -> cooldown
+        _, pending = scheduler.tick(now=clock())  # timeout -> pending removal
+        self.assertEqual(len(pending), 1)
+        scheduler.ack_handle_removed(HASH_A, now=clock())  # now COOLDOWN
 
         # A late add_torrent_alert arrives. The candidate is now in COOLDOWN,
         # so on_add_started must not flip it back to IN_FLIGHT.
@@ -633,15 +649,15 @@ class PersistResultQueueTests(unittest.TestCase):
         # No counter should increment for a hash the scheduler no longer owns.
         self.assertEqual(scheduler.diagnostics.persist_success, 0)
 
-    def test_bounded_persist_result_deque(self):
-        scheduler, _ = make_scheduler(max_queue_size=4)
+    def test_bounded_persist_result_dict(self):
+        scheduler, _ = make_scheduler(persist_result_capacity=4)
 
         for i in range(20):
             scheduler.enqueue_persist_result(f"{i:040d}", True)
 
         with scheduler._persist_results_lock:
             size = len(scheduler._persist_results)
-        self.assertLessEqual(size, scheduler.config.max_queue_size)
+        self.assertLessEqual(size, scheduler.config.persist_result_capacity)
 
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +1016,212 @@ class RestartAndCleanupTests(unittest.TestCase):
         scheduler, clock = make_scheduler()
         admission = scheduler.on_announce(HASH_A, now=clock(), cache_exists=True)
         self.assertEqual(admission, ss.Admission.SKIP_CACHED)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for code-review findings on initial PR head 46b501a
+# ---------------------------------------------------------------------------
+
+class RegressionTests(unittest.TestCase):
+    """Verify fixes for the 7 findings from the independent review.
+
+    Each test is named after the finding it addresses so the mapping is
+    explicit.
+    """
+
+    # Finding 1: timed-out handles must actually be removed by the caller;
+    # the slot is released only after ack.
+    def test_f1_timeout_two_phase_protocol(self):
+        scheduler, clock = make_scheduler(acquisition_timeout=5.0)
+        scheduler.on_announce(HASH_A, now=clock())
+        handle = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle, now=clock())
+        clock.advance(6.0)
+
+        # tick returns the handle but keeps state at PENDING_REMOVAL.
+        promoted, pending = scheduler.tick(now=clock())
+        self.assertEqual(promoted, [])
+        self.assertEqual(pending, [(HASH_A, handle)])
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PENDING_REMOVAL)
+        # Slot is still occupied until ack.
+        self.assertEqual(scheduler.in_flight_count(), 1)
+
+        # Caller removes the handle and acks; slot releases.
+        scheduler.ack_handle_removed(HASH_A, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+        self.assertEqual(scheduler.in_flight_count(), 0)
+
+        # A new announce for the same hash after cooldown expires can start
+        # fresh, and LIVE_HANDLES/TORRENTS no longer suppress it.
+        clock.advance(100.0)
+        admission = scheduler.on_announce(HASH_A, now=clock())
+        self.assertEqual(admission, ss.Admission.ADMITTED_STARTED)
+
+    # Finding 2: _candidates and cooldown registry must stay bounded
+    # across many unique hashes and repeated failures.
+    def test_f2_candidates_bounded_across_many_hashes(self):
+        scheduler, clock = make_scheduler(
+            max_candidates=8,
+            max_cooldown_entries=4,
+            cooldown_base_seconds=1.0,
+            cooldown_ttl=100.0,
+            cooldown_jitter=0.0,
+        )
+        # Drive 20 unique hashes through failure; both registry and
+        # _candidates must remain within their bounds.
+        for i in range(20):
+            h = f"{i:040d}"
+            scheduler.on_announce(h, now=clock())
+            scheduler.on_async_add_failed(h, now=clock())
+            clock.advance(0.01)
+
+        self.assertLessEqual(len(scheduler.cooldowns), 4)
+        self.assertLessEqual(scheduler.candidate_count(), 8)
+
+    def test_f2_repeated_failures_do_not_unbound_order(self):
+        scheduler, clock = make_scheduler(
+            cooldown_base_seconds=0.1,
+            cooldown_jitter=0.0,
+            cooldown_ttl=100.0,
+        )
+        for _ in range(50):
+            scheduler.on_announce(HASH_A, now=clock())
+            scheduler.on_async_add_failed(HASH_A, now=clock())
+            clock.advance(0.2)  # past cooldown each time
+
+        # _order must not grow unboundedly: the registry only has one entry
+        # for HASH_A, and our deduplicated _order tracks it once.
+        self.assertEqual(len(scheduler.cooldowns._order_set), 1)
+
+    # Finding 3: persist results must not be silently dropped.
+    def test_f3_persist_results_latest_writer_wins(self):
+        """When capacity is bounded, duplicate results collapse; unique
+        results up to capacity are all preserved."""
+
+        scheduler, clock = make_scheduler(persist_result_capacity=16)
+        hashes = [f"{i:040d}" for i in range(10)]
+        for h in hashes:
+            scheduler.on_announce(h, now=clock())
+            scheduler.on_metadata_received(h, now=clock())
+            scheduler.enqueue_persist_result(h, True)
+
+        scheduler.drain_persist_results(now=clock())
+
+        persisting = [
+            h for h, c in scheduler._candidates.items()
+            if c.state is ss.CandidateState.PERSISTING
+        ]
+        self.assertEqual(persisting, [])
+        self.assertEqual(scheduler.diagnostics.persist_success, 10)
+
+    def test_f3_latest_persist_result_wins(self):
+        scheduler, clock = make_scheduler()
+        scheduler.on_announce(HASH_A, now=clock())
+        scheduler.on_metadata_received(HASH_A, now=clock())
+
+        # Worker reports failure, then success (out-of-order but same hash).
+        scheduler.enqueue_persist_result(HASH_A, False)
+        scheduler.enqueue_persist_result(HASH_A, True)
+        scheduler.drain_persist_results(now=clock())
+
+        # The success result wins; no cooldown.
+        self.assertIsNone(scheduler.state_of(HASH_A))
+        self.assertEqual(scheduler.diagnostics.persist_success, 1)
+        self.assertEqual(scheduler.diagnostics.persist_failure, 0)
+
+    # Finding 4: old alerts cannot mutate a new attempt for the same hash.
+    def test_f4_old_metadata_cannot_mutate_new_attempt(self):
+        scheduler, clock = make_scheduler(
+            acquisition_timeout=5.0,
+            cooldown_base_seconds=1.0,
+            cooldown_jitter=0.0,
+        )
+        # First attempt: register handle, time out, ack removal, cooldown expires.
+        scheduler.on_announce(HASH_A, now=clock())
+        handle_old = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle_old, now=clock())
+        clock.advance(6.0)
+        _, pending = scheduler.tick(now=clock())
+        scheduler.ack_handle_removed(HASH_A, now=clock())
+        clock.advance(100.0)  # past cooldown
+
+        # Second attempt starts with a new handle.
+        scheduler.on_announce(HASH_A, now=clock())
+        handle_new = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle_new, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+
+        # Old metadata_received_alert arrives with the OLD handle; must be
+        # rejected without transitioning the new attempt.
+        owned = scheduler.on_metadata_received(HASH_A, handle=handle_old, now=clock())
+        self.assertFalse(owned)
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.diagnostics.late_alert_ignored, 1)
+
+        # New handle's metadata_received is accepted.
+        owned = scheduler.on_metadata_received(HASH_A, handle=handle_new, now=clock())
+        self.assertTrue(owned)
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PERSISTING)
+
+    # Finding 5: persist queue full must release slot and enter cooldown
+    # from IN_FLIGHT, not be silently ignored.
+    def test_f5_persist_queue_full_from_in_flight(self):
+        scheduler, clock = make_scheduler()
+        scheduler.on_announce(HASH_A, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.in_flight_count(), 1)
+
+        # Directly report queue full without going through metadata_received.
+        released = scheduler.on_persist_queue_full(HASH_A, now=clock())
+
+        self.assertTrue(released)
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+        self.assertEqual(scheduler.in_flight_count(), 0)
+        self.assertEqual(scheduler.diagnostics.persist_queue_full, 1)
+
+    # Finding 6: queue-full drop must apply bounded overload suppression.
+    def test_f6_queue_drop_applies_cooldown(self):
+        scheduler, clock = make_scheduler(
+            max_queue_size=1,
+            max_concurrent_acquisitions=1,
+            queue_drop_cooldown_seconds=5.0,
+            cooldown_jitter=0.0,
+        )
+        scheduler.on_announce(HASH_A, now=clock())  # starts
+        scheduler.on_announce(HASH_B, now=clock())  # queued
+        admission = scheduler.on_announce(HASH_C, now=clock())  # dropped
+
+        self.assertEqual(admission, ss.Admission.DROP_QUEUE_FULL)
+        # HASH_C now has a cooldown; repeat announces are skipped.
+        self.assertEqual(
+            scheduler.on_announce(HASH_C, now=clock()),
+            ss.Admission.SKIP_COOLDOWN,
+        )
+        # After the short queue-drop cooldown expires AND the queue has
+        # room, HASH_C can be admitted.
+        clock.advance(6.0)
+        # Clear HASH_B by completing HASH_A's acquisition.
+        scheduler.on_metadata_received(HASH_A, now=clock())
+        scheduler.tick(now=clock())  # promotes HASH_B -> now HASH_A's slot is PERSISTING
+        # HASH_B is now IN_FLIGHT; queue is empty. HASH_C can now be admitted.
+        admission = scheduler.on_announce(HASH_C, now=clock())
+        self.assertEqual(admission, ss.Admission.ADMITTED_QUEUED)
+
+    # Finding 7: hash_overflow counts distinct overflow hashes, not repeats.
+    def test_f7_hash_overflow_counts_distinct(self):
+        diag = ss.Diagnostics(budget=2)
+        diag.observe_hash(HASH_A)
+        diag.observe_hash(HASH_B)
+        # HASH_C overflows once.
+        diag.observe_hash(HASH_C)
+        # Repeat announces of HASH_C must not inflate overflow count.
+        diag.observe_hash(HASH_C)
+        diag.observe_hash(HASH_C)
+        # A fourth distinct hash also overflows.
+        diag.observe_hash(HASH_D)
+
+        self.assertEqual(diag.hash_overflow, 2)
+        self.assertTrue(diag.hash_set_saturated)
 
 
 if __name__ == "__main__":
