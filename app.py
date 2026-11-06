@@ -18,6 +18,13 @@ import requests
 import libtorrent as lt
 
 from management import CommandDispatcher, LiveHandles, ManagementService, start_management_server
+from sniff_scheduler import (
+    Admission,
+    Diagnostics,
+    SniffScheduler,
+    SniffSchedulerConfig,
+    config_from_environment,
+)
 
 from sqlalchemy import (
     BigInteger,
@@ -58,6 +65,7 @@ METADATA_QUEUE = None
 MANAGEMENT_DISPATCHER = None
 MANAGEMENT_SERVER = None
 LIVE_HANDLES = None
+SNIFF_SCHEDULER = None
 
 
 def env_int(name, default):
@@ -823,7 +831,13 @@ def check_status():
 
 
 def persist_torrent_metadata(torrent_file, info_hash):
-    """Persist metadata outside the latency-sensitive alert loop."""
+    """Persist metadata outside the latency-sensitive alert loop.
+
+    Returns True on success, False on any failure. The caller (the
+    metadata worker) surfaces the result to the sniff scheduler so that
+    failed writes enter cooldown rather than silently looping.
+    """
+
     try:
         torrent_obj = lt.create_torrent(torrent_file)
         os.makedirs(TORRENT_DIR, exist_ok=True)
@@ -834,20 +848,24 @@ def persist_torrent_metadata(torrent_file, info_hash):
             f.write(lt.bencode(torrent_obj.generate()))
 
         logging.info("torrent cached: %s", info_hash)
+        return True
     except Exception as e:
         logging.warning("failed to persist torrent %s: %s", info_hash, e)
+        return False
 
 
 def metadata_worker():
     while True:
         torrent_file, info_hash = METADATA_QUEUE.get()
         try:
-            persist_torrent_metadata(torrent_file, info_hash)
+            success = persist_torrent_metadata(torrent_file, info_hash)
         finally:
             try:
                 del TORRENTS[info_hash]
             except KeyError:
                 pass
+            if SNIFF_SCHEDULER is not None:
+                SNIFF_SCHEDULER.enqueue_persist_result(info_hash, success)
             METADATA_QUEUE.task_done()
 
 
@@ -870,15 +888,23 @@ def handle_alert_metadata_received(a):
     handle.pause()
     status = handle.status()
     torrent_file = status.torrent_file
-    if torrent_file is None:
-        return
 
     try:
-        info_hashes = torrent_file.info_hashes()
+        info_hashes = (torrent_file.info_hashes() if torrent_file is not None
+                       else status.info_hashes)
         info_hash = get_info_hash(info_hashes)
     except Exception as e:
         logging.warning("failed to read torrent info-hash: %s", e)
         info_hash = get_handle_info_hash(handle)
+
+    scheduler = SNIFF_SCHEDULER
+
+    # torrent_file missing: metadata acquisition produced nothing usable.
+    if torrent_file is None:
+        if scheduler is not None and info_hash is not None:
+            scheduler.on_metadata_missing(info_hash)
+        _teardown_metadata_handle(handle, info_hash)
+        return
 
     queued = False
     if info_hash is None:
@@ -892,9 +918,32 @@ def handle_alert_metadata_received(a):
         except queue.Full:
             logging.warning("metadata queue full, dropping torrent: %s", info_hash)
 
+    if scheduler is not None and info_hash is not None:
+        if queued:
+            # The scheduler now waits for the persistence worker's result.
+            scheduler.on_metadata_received(info_hash)
+        else:
+            # Queue was full or TORRENTS full; the scheduler's slot stays
+            # reserved until the worker would have reported. We release
+            # it via note_persist_queue_full so the hash can cool down.
+            scheduler.note_persist_queue_full(info_hash)
+
     # Keep a TTL reservation while the background worker persists this hash.
     if not queued:
-        del_handle_torrents(handle, info_hash)
+        _teardown_metadata_handle(handle, info_hash)
+    else:
+        SESSION.remove_torrent(handle)
+        if info_hash is not None and LIVE_HANDLES is not None:
+            LIVE_HANDLES.discard(info_hash)
+
+
+def _teardown_metadata_handle(handle, info_hash):
+    """Remove the handle from the session and tracking maps.
+
+    Shared by the metadata-received path when no persistence job was
+    queued. Kept as a helper so the two branches stay symmetric.
+    """
+
     SESSION.remove_torrent(handle)
     if info_hash is not None and LIVE_HANDLES is not None:
         LIVE_HANDLES.discard(info_hash)
@@ -935,37 +984,105 @@ def handle_alert_announce_peer(a):
     if OPTIONS.download_mode:
         return
 
-    if isinstance(a, lt.dht_pkt_alert):
-        try:
-            pkt = bytes(a.pkt_buf)
-        except Exception:
+    if not isinstance(a, lt.dht_pkt_alert):
+        return
+
+    try:
+        pkt = bytes(a.pkt_buf)
+    except Exception:
+        if SNIFF_SCHEDULER is not None:
+            SNIFF_SCHEDULER.diagnostics.announce_peer_invalid += 1
+        return
+
+    try:
+        data = lt.bdecode(pkt)
+    except Exception:
+        if SNIFF_SCHEDULER is not None:
+            SNIFF_SCHEDULER.diagnostics.announce_peer_invalid += 1
+        return
+
+    if data.get(b'y') != b'q' or data.get(b'q') != b'announce_peer':
+        return
+
+    args = data.get(b'a', {})
+    info_hash_bytes = args.get(b'info_hash')
+    if not info_hash_bytes:
+        return
+
+    try:
+        info_hash_obj = lt.sha1_hash(info_hash_bytes)
+        info_hash = str(info_hash_obj)
+    except Exception:
+        if SNIFF_SCHEDULER is not None:
+            SNIFF_SCHEDULER.diagnostics.announce_peer_invalid += 1
+        return
+
+    scheduler = SNIFF_SCHEDULER
+    info_hash_file = os.path.join(TORRENT_DIR, info_hash + '.torrent')
+    cache_exists = os.path.exists(info_hash_file)
+    session_known = info_hash in TORRENTS or (
+        LIVE_HANDLES is not None and info_hash in LIVE_HANDLES
+    )
+
+    if scheduler is None:
+        # Scheduler disabled (shouldn't happen in sniff mode, but be defensive).
+        if cache_exists:
+            logging.debug("torrent local detected: %s skip", info_hash)
             return
-
-        try:
-            data = lt.bdecode(pkt)
-        except Exception:
+        if session_known:
+            logging.debug("torrent running detected: %s skip", info_hash)
             return
+        logging.info("torrent detected: %s", info_hash)
+        add_torrent(info_hash)
+        return
 
-        if data.get(b'y') == b'q' and data.get(b'q') == b'announce_peer':
-            args = data.get(b'a', {})
-            info_hash_bytes = args.get(b'info_hash')
+    admission = scheduler.on_announce(
+        info_hash,
+        cache_exists=cache_exists,
+        session_known=session_known,
+    )
 
-            if info_hash_bytes:
-                try:
-                    info_hash_obj = lt.sha1_hash(info_hash_bytes)
-                    info_hash = str(info_hash_obj)
-                except Exception:
-                    return
+    if admission is Admission.ADMITTED_STARTED:
+        _start_sniff_acquisition(info_hash)
+        return
 
-                info_hash_file = os.path.join(TORRENT_DIR, info_hash + '.torrent')
-                if os.path.exists(info_hash_file):
-                    logging.debug("torrent local detected: %s skip", info_hash)
-                    return
-                if info_hash in TORRENTS:
-                    logging.debug("torrent running detected: %s skip", info_hash)
-                    return
-                logging.info("torrent detected: %s", info_hash)
-                add_torrent(info_hash)
+    if admission is Admission.ADMITTED_QUEUED:
+        logging.debug("torrent queued: %s", info_hash)
+        return
+
+    if admission is Admission.SKIP_CACHED:
+        logging.debug("torrent local detected: %s skip", info_hash)
+    elif admission is Admission.SKIP_KNOWN_TO_SESSION:
+        logging.debug("torrent running detected: %s skip", info_hash)
+    elif admission is Admission.SKIP_IN_FLIGHT:
+        logging.debug("torrent in-flight: %s skip", info_hash)
+    elif admission is Admission.SKIP_PENDING:
+        logging.debug("torrent pending: %s skip", info_hash)
+    elif admission is Admission.SKIP_PERSISTING:
+        logging.debug("torrent persisting: %s skip", info_hash)
+    elif admission is Admission.SKIP_COOLDOWN:
+        logging.debug("torrent cooldown: %s skip", info_hash)
+    elif admission is Admission.DROP_QUEUE_FULL:
+        logging.debug("torrent queue full: %s drop", info_hash)
+
+
+def _start_sniff_acquisition(info_hash):
+    """Call ``add_torrent`` for a scheduler-admitted hash.
+
+    Reports sync failures back to the scheduler so its in-flight slot is
+    released. Exceptions propagate; the caller (alert loop) will catch
+    them in the normal way.
+    """
+
+    logging.info("torrent detected: %s", info_hash)
+    try:
+        accepted = add_torrent(info_hash)
+    except Exception:
+        if SNIFF_SCHEDULER is not None:
+            SNIFF_SCHEDULER.on_sync_add_failure(info_hash)
+        raise
+    if not accepted and SNIFF_SCHEDULER is not None:
+        SNIFF_SCHEDULER.on_sync_add_failure(info_hash)
 
 
 def get_info_hash(info_hashes):
@@ -1023,21 +1140,41 @@ def handle_alert_state_update(a):
 
 
 def handle_alert_add_torrent(a):
-    if isinstance(a, lt.add_torrent_alert):
-        handle = a.handle
-        if not handle.is_valid():
-            try:
-                info_hash = get_info_hash(a.params.info_hashes)
-                if info_hash and TORRENTS.get(info_hash) is None:
+    if not isinstance(a, lt.add_torrent_alert):
+        return
+
+    scheduler = SNIFF_SCHEDULER
+    handle = a.handle
+
+    if not handle.is_valid():
+        try:
+            info_hash = get_info_hash(a.params.info_hashes)
+        except AttributeError:
+            info_hash = None
+        if info_hash:
+            if scheduler is not None:
+                scheduler.on_invalid_handle_alert(info_hash)
+            if TORRENTS.get(info_hash) is None:
+                try:
                     del TORRENTS[info_hash]
-            except (AttributeError, KeyError):
-                pass
-            return
-        handle.set_max_connections(60)
-        handle.set_max_uploads(-1)
-        if not add_handle_torrents(handle):
-            logging.warning("torrent capacity reached, removing added torrent")
-            SESSION.remove_torrent(handle)
+                except KeyError:
+                    pass
+        return
+
+    handle.set_max_connections(60)
+    handle.set_max_uploads(-1)
+    if not add_handle_torrents(handle):
+        logging.warning("torrent capacity reached, removing added torrent")
+        SESSION.remove_torrent(handle)
+        return
+
+    if scheduler is not None:
+        try:
+            info_hash = get_info_hash(a.params.info_hashes)
+        except AttributeError:
+            info_hash = None
+        if info_hash is not None:
+            scheduler.on_add_started(info_hash, handle)
 
 
 def handle_alert_log(a):
@@ -1087,6 +1224,46 @@ def print_alerts_log():
 
 # -------------------- Main alert loop --------------------
 
+def _drive_sniff_scheduler(now):
+    """Tick the sniff scheduler, drain results, remove timed-out handles.
+
+    Called once per alert-loop iteration. When the scheduler is not
+    initialised (download mode) this is a no-op.
+    """
+
+    scheduler = SNIFF_SCHEDULER
+    if scheduler is None:
+        return
+
+    scheduler.drain_persist_results(now=now)
+
+    def _cache_exists(info_hash):
+        return os.path.exists(os.path.join(TORRENT_DIR, info_hash + '.torrent'))
+
+    def _session_known(info_hash):
+        return info_hash in TORRENTS or (
+            LIVE_HANDLES is not None and info_hash in LIVE_HANDLES
+        )
+
+    promoted = scheduler.tick(
+        now=now,
+        cache_exists=_cache_exists,
+        session_known=_session_known,
+    )
+    for info_hash in promoted:
+        _start_sniff_acquisition(info_hash)
+
+    # Remove libtorrent handles whose acquisition exceeded the timeout.
+    for handle in scheduler.timed_out_handles(now):
+        try:
+            if handle is not None and handle.is_valid():
+                SESSION.remove_torrent(handle)
+        except Exception:
+            pass
+
+    scheduler.maybe_emit_diagnostics(now=now)
+
+
 def alert_handle():
     global ALIVE
     global ALERTS_LOG
@@ -1105,6 +1282,7 @@ def alert_handle():
         handle_alerts()
         if MANAGEMENT_DISPATCHER:
             MANAGEMENT_DISPATCHER.drain()
+        _drive_sniff_scheduler(now)
         print_alerts_log()
 
         c = CONSOLE.sleep_and_input(0.5)
@@ -1205,6 +1383,7 @@ def main():
     global METADATA_QUEUE
     global MANAGEMENT_DISPATCHER
     global MANAGEMENT_SERVER
+    global SNIFF_SCHEDULER
 
     CONSOLE = get_console()
     OPTIONS, args = parse_option()
@@ -1275,6 +1454,28 @@ def main():
 
     # 持久化可能包含网络和磁盘 I/O，使用有界队列避免阻塞 alert 消费。
     METADATA_QUEUE = queue.Queue(maxsize=METADATA_QUEUE_SIZE)
+
+    # Sniff-mode scheduler: bounds concurrent metadata acquisitions,
+    # retries failures with bounded backoff, and emits periodic
+    # diagnostics. Disabled in download mode (the scheduler only governs
+    # DHT announce_peer handling).
+    if not OPTIONS.download_mode:
+        try:
+            scheduler_config = config_from_environment()
+            scheduler_config.validate()
+            SNIFF_SCHEDULER = SniffScheduler(scheduler_config)
+            logging.info(
+                "sniff scheduler enabled: max_in_flight=%d max_queue=%d "
+                "starts_per_sec=%.2f acquisition_timeout=%.0fs",
+                scheduler_config.max_concurrent_acquisitions,
+                scheduler_config.max_queue_size,
+                scheduler_config.max_starts_per_second,
+                scheduler_config.acquisition_timeout,
+            )
+        except ValueError as exc:
+            logging.error("invalid sniff scheduler configuration: %s", exc)
+            raise SystemExit(2) from exc
+
     metadata_thread = threading.Thread(target=metadata_worker, daemon=True)
     metadata_thread.start()
 

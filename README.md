@@ -57,6 +57,86 @@ Supported environment settings are:
 | `MANAGEMENT_TOKEN` | empty | Bearer secret, optional on loopback, required for non-loopback |
 | `MANAGEMENT_INSTANCE_ID` | hostname | Stable operator-selected instance identity |
 
+## Sniff-mode scheduler
+
+When running in sniff mode (the default, no command-line torrents), the process listens to DHT `announce_peer` messages and opportunistically fetches metadata to cache as `.torrent` files. A bounded scheduler sits between the announce alert and `session.async_add_torrent` so a burst of unique hashes cannot saturate the libtorrent session or the metadata persistence pipeline.
+
+The scheduler is disabled in download mode. The `.torrent` cache, `TORRENTS` TTL, `LIVE_HANDLES`, and the session upload/download rate flags all continue to work unchanged.
+
+Supported scheduler environment settings:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `SNIFF_MAX_QUEUE` | `64` | Maximum candidates waiting for an in-flight slot |
+| `SNIFF_MAX_IN_FLIGHT` | `4` | Maximum concurrent metadata acquisitions |
+| `SNIFF_MAX_STARTS_PER_SECOND` | `1.0` | Maximum new acquisitions started per rate window |
+| `SNIFF_START_RATE_WINDOW` | `1.0` | Rate window in seconds |
+| `SNIFF_ACQUISITION_TIMEOUT` | `120.0` | Seconds before an in-flight acquisition is timed out |
+| `SNIFF_QUEUE_WAIT_TIMEOUT` | `300.0` | Seconds a candidate may wait in queue before cooldown |
+| `SNIFF_COOLDOWN_BASE` | `30.0` | Initial retry delay after failure (seconds) |
+| `SNIFF_COOLDOWN_MAX` | `3600.0` | Maximum retry delay (seconds) |
+| `SNIFF_COOLDOWN_MULTIPLIER` | `2.0` | Exponential backoff multiplier |
+| `SNIFF_COOLDOWN_JITTER` | `0.25` | ±fraction of random jitter applied to each delay |
+| `SNIFF_MAX_COOLDOWNS` | `512` | Maximum distinct hashes tracked in cooldown registry |
+| `SNIFF_COOLDOWN_TTL` | `7200.0` | Seconds before a cooldown entry expires |
+| `SNIFF_DIAGNOSTICS_INTERVAL` | `60.0` | Seconds between aggregate log lines |
+| `SNIFF_DISTINCT_HASH_BUDGET` | `256` | Distinct hash tracking budget per diagnostics window |
+
+All values must be positive. Invalid values fail fast at startup with a clear error message.
+
+### Diagnostics
+
+Every `SNIFF_DIAGNOSTICS_INTERVAL` seconds, the alert loop logs a single aggregate line prefixed with `sniff-scheduler`. Each field is a per-window counter:
+
+```
+sniff-scheduler announce_peer_received=142 announce_peer_invalid=0
+  distinct_hashes=97 hash_set_saturated=false hash_overflow=0
+  skip_cached_file=18 skip_pending=0 skip_in_flight=12 skip_persisting=3
+  skip_cooldown=7 skip_known_to_session=5
+  drop_queue_full=0 admitted_queued=0 admitted_started=97
+  add_started=97 add_failed_sync=0 add_failed_async=1 invalid_handle_alert=1
+  metadata_success=95 metadata_missing=0 metadata_timeout=1 late_alert_ignored=0
+  persist_success=94 persist_failure=1 persist_queue_full=0
+  queue_wait_timeouts=0 queue_evictions=0
+  cooldown_entries_recorded=3 cooldown_entries_evicted=0
+  queued=0 in_flight=3 persisting=1 cooldowns=2
+```
+
+Info-hashes are never logged or labelled individually. `distinct_hashes` is a lower bound once `hash_set_saturated` becomes `true` within a window; `hash_overflow` counts how many hashes fell outside the tracking budget.
+
+`announce_peer_received` counts valid DHT `announce_peer` messages after decode; `announce_peer_invalid` counts packets that failed decode or were not `announce_peer` queries. The scheduler's skip / drop counters cover every non-admitted announce; the sum of all skip, drop, admitted, and duplicate (`skip_in_flight`, `skip_pending`, `skip_persisting`, `skip_known_to_session`) equals `announce_peer_received` minus `announce_peer_invalid` minus `skip_cached_file`.
+
+### Baseline procedure
+
+These counters are the supported way to attribute sniff-mode load. To measure a baseline:
+
+1. Start the process in sniff mode with the default configuration.
+2. Let it run for at least `SNIFF_DIAGNOSTICS_INTERVAL` seconds.
+3. Collect consecutive `sniff-scheduler` log lines.
+4. Compare `admitted_started` (new metadata acquisitions the scheduler launched) against the host or container RX/TX bytes from `ss`, `ip -s link`, or cgroup counters over the same window. Do **not** treat `announce_peer_received` as network bytes; it counts DHT query messages observed by libtorrent's alert path, not total NIC traffic. DHT and metadata/peer traffic are distinct: `announce_peer_received` is DHT load; `admitted_started` is metadata acquisition load; neither is the host's total byte count.
+5. If a specific host/container network cap is required, enforce it at the deployment layer (cgroup, iptables, orchestrator limit). The scheduler does not measure or enforce total NIC bytes.
+
+Report any measured baseline only if actually measured; otherwise document that the production cause of high traffic remains unproven and reproduce with the diagnostic counters above.
+
+### Throughput tradeoffs
+
+- Lower `SNIFF_MAX_IN_FLIGHT` reduces concurrent metadata traffic but increases queue wait time and the chance of `queue_wait_timeouts`.
+- Higher `SNIFF_MAX_STARTS_PER_SECOND` admits bursts at the cost of more simultaneous metadata connections.
+- Shorter `SNIFF_ACQUISITION_TIMEOUT` frees slots faster but may abort acquisitions that would have succeeded on a slower network.
+- The retry policy for overload drops (queue full) is identical to failed acquisition: the hash enters the same cooldown registry with the same backoff.
+
+### Restart and cache cleanup
+
+The scheduler's queue, in-flight set, and cooldown registry are in-memory only. A process restart clears them. The authoritative durable signal is the `.torrent` cache file in `TORRENT_DIR`: any hash whose cache file exists is skipped before the scheduler is consulted, even across restarts. Daily cache cleanup (`cleanup_old_cache_files`, default 7 days) removes files older than the configured threshold; hashes whose cache was deleted become eligible for reacquisition, subject to the usual scheduler bounds.
+
+### Future budget accounting
+
+Strict host/container network caps need deployment-level counters and enforcement. A proposed extension path:
+
+- Ingress / egress measurement point: cgroup or orchestrator counters, not application-level torrent bytes.
+- In-flight tasks at restart: the scheduler does not resume in-flight state; hashes whose cache was not persisted before restart are reacquired on the next announce.
+- Overage logging: a future extension could read the deployment counters and log when a rolling window exceeds a configured budget; the scheduler itself does not poll network counters.
+
 ## CLI
 
 `torrentctl` defaults to `http://127.0.0.1:8080`. The address resolution order is:
