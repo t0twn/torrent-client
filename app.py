@@ -906,10 +906,33 @@ def handle_alert_metadata_received(a):
         _teardown_metadata_handle(handle, info_hash)
         return
 
-    queued = False
     if info_hash is None:
         logging.warning("dropping metadata with no valid info-hash")
-    elif not TORRENTS.put(info_hash, None):
+        _teardown_metadata_handle(handle, None)
+        return
+
+    # Ownership check BEFORE any side effects. A stale metadata alert
+    # from a previous timed-out attempt must not queue persistence,
+    # reserve TORRENTS capacity, or mutate scheduler state. The
+    # scheduler validates the handle identity against its recorded
+    # candidate; only when it accepts do we proceed.
+    scheduler_accepted = False
+    scheduler_queue_full = False
+    if scheduler is not None:
+        scheduler_accepted = scheduler.on_metadata_received(info_hash, handle=handle)
+        if not scheduler_accepted:
+            # Either the scheduler doesn't own this hash (another path
+            # added it) or a stale alert arrived. Clean up the handle
+            # without queueing persistence.
+            _teardown_metadata_handle(handle, info_hash)
+            return
+    else:
+        # No scheduler: proceed with the pre-scheduler semantics (direct
+        # TORRENTS reservation and queueing).
+        scheduler_accepted = True
+
+    queued = False
+    if not TORRENTS.put(info_hash, None):
         logging.warning("torrent capacity reached, dropping metadata: %s", info_hash)
     else:
         try:
@@ -918,31 +941,23 @@ def handle_alert_metadata_received(a):
         except queue.Full:
             logging.warning("metadata queue full, dropping torrent: %s", info_hash)
 
-    scheduler_entered_cooldown = False
-    if scheduler is not None and info_hash is not None:
-        if queued:
-            # Pass the handle so the scheduler can validate it against
-            # the in-flight candidate's recorded handle. A stale alert
-            # from a previous timed-out attempt is rejected here.
-            scheduler.on_metadata_received(info_hash, handle=handle)
-        else:
-            # Queue was full or TORRENTS full. The scheduler treats this
-            # as an IN_FLIGHT terminal failure: slot released, cooldown
-            # entered. We must also clear the TORRENTS reservation we
-            # just created so the hash can be retried after cooldown.
-            if scheduler.on_persist_queue_full(info_hash):
-                scheduler_entered_cooldown = True
-                try:
-                    del TORRENTS[info_hash]
-                except KeyError:
-                    pass
+    if not queued:
+        # Persistence queue full or TORRENTS full: release the
+        # scheduler's slot and enter cooldown.
+        if scheduler is not None:
+            scheduler.on_persist_queue_full(info_hash)
+            scheduler_queue_full = True
+        try:
+            del TORRENTS[info_hash]
+        except KeyError:
+            pass
 
     # Keep a TTL reservation while the background worker persists this hash.
-    if not queued or scheduler_entered_cooldown:
+    if not queued or scheduler_queue_full:
         _teardown_metadata_handle(handle, info_hash)
     else:
         SESSION.remove_torrent(handle)
-        if info_hash is not None and LIVE_HANDLES is not None:
+        if LIVE_HANDLES is not None:
             LIVE_HANDLES.discard(info_hash)
 
 
@@ -1162,7 +1177,10 @@ def handle_alert_add_torrent(a):
             info_hash = None
         if info_hash:
             if scheduler is not None:
-                scheduler.on_invalid_handle_alert(info_hash)
+                # Pass the invalid handle so the scheduler can reject
+                # stale invalid alerts that arrive after a newer attempt
+                # has already recorded a valid handle for the same hash.
+                scheduler.on_invalid_handle_alert(info_hash, alert_handle=handle)
             if TORRENTS.get(info_hash) is None:
                 try:
                     del TORRENTS[info_hash]
@@ -1272,19 +1290,33 @@ def _drive_sniff_scheduler(now):
 
     # Two-phase timeout removal: remove the handle from the session and
     # tracking maps, then ack to the scheduler so it can release the slot.
+    # If remove_torrent fails, we keep the candidate in PENDING_REMOVAL
+    # and retry on the next loop iteration; this preserves the concurrency
+    # bound even when libtorrent refuses the removal.
     for info_hash, handle in pending_removals:
-        try:
-            if handle is not None and handle.is_valid():
+        removal_succeeded = False
+        if handle is not None and handle.is_valid():
+            try:
                 SESSION.remove_torrent(handle)
-        except Exception as e:
-            logging.warning("failed to remove timed-out handle %s: %s", info_hash, e)
-        try:
-            del TORRENTS[info_hash]
-        except KeyError:
-            pass
-        if LIVE_HANDLES is not None:
-            LIVE_HANDLES.discard(info_hash)
-        scheduler.ack_handle_removed(info_hash, now=now)
+                removal_succeeded = True
+            except Exception as e:
+                logging.warning(
+                    "failed to remove timed-out handle for %s: %s; "
+                    "will retry on next loop",
+                    info_hash, e,
+                )
+        else:
+            # Handle already invalid / None: treat removal as succeeded.
+            removal_succeeded = True
+
+        if removal_succeeded:
+            try:
+                del TORRENTS[info_hash]
+            except KeyError:
+                pass
+            if LIVE_HANDLES is not None:
+                LIVE_HANDLES.discard(info_hash)
+            scheduler.ack_handle_removed(info_hash, now=now)
 
     scheduler.maybe_emit_diagnostics(now=now)
 

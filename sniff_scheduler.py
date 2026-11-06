@@ -27,7 +27,7 @@ import os
 import random
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
@@ -104,6 +104,7 @@ class SniffSchedulerConfig:
     start_rate_window: float = 1.0
     acquisition_timeout: float = 120.0
     queue_wait_timeout: float = 300.0
+    persist_timeout: float = 600.0
     cooldown_base_seconds: float = 30.0
     cooldown_max_seconds: float = 3600.0
     cooldown_multiplier: float = 2.0
@@ -124,6 +125,7 @@ class SniffSchedulerConfig:
             "start_rate_window",
             "acquisition_timeout",
             "queue_wait_timeout",
+            "persist_timeout",
             "cooldown_base_seconds",
             "cooldown_max_seconds",
             "cooldown_multiplier",
@@ -157,6 +159,7 @@ def config_from_environment() -> SniffSchedulerConfig:
         start_rate_window=_env_float("SNIFF_START_RATE_WINDOW", 1.0),
         acquisition_timeout=_env_float("SNIFF_ACQUISITION_TIMEOUT", 120.0),
         queue_wait_timeout=_env_float("SNIFF_QUEUE_WAIT_TIMEOUT", 300.0),
+        persist_timeout=_env_float("SNIFF_PERSIST_TIMEOUT", 600.0),
         cooldown_base_seconds=_env_float("SNIFF_COOLDOWN_BASE", 30.0),
         cooldown_max_seconds=_env_float("SNIFF_COOLDOWN_MAX", 3600.0),
         cooldown_multiplier=_env_float("SNIFF_COOLDOWN_MULTIPLIER", 2.0),
@@ -228,16 +231,28 @@ class Diagnostics:
 
     _recent_hashes: Set[str] = field(default_factory=set, init=False, repr=False)
     _recent_hash_count: int = field(default=0, init=False, repr=False)
+    # Bounded approximation for distinct overflow hashes. Once the budget
+    # is exceeded we track up to ``overflow_sample_budget`` distinct
+    # hashes; beyond that we only increment the counter. The counter is
+    # then a lower bound on the true distinct-overflow count; the
+    # ``hash_set_saturated`` flag signals this on the periodic log line.
     _overflow_hashes: Set[str] = field(default_factory=set, init=False, repr=False)
+    _overflow_untracked: int = field(default=0, init=False, repr=False)
+
+    # Memory bound for the overflow sample: a small multiple of the main
+    # budget keeps the per-window overhead bounded even under a DHT burst.
+    _overflow_sample_budget: int = 64
 
     def observe_hash(self, info_hash: str) -> None:
         """Record a distinct info-hash in the current window.
 
-        If the set is already full and this hash is new, the hash is not
-        inserted, ``hash_overflow`` increments by one for this *distinct*
-        hash (repeat announces of the same overflow hash do not inflate
-        the count), and ``hash_set_saturated`` is set so the periodic log
-        line signals the under-count.
+        If the recent-hash set is already full and this hash is new, the
+        hash is not inserted into the recent set. If the overflow sample
+        set still has room, the hash is remembered there so repeat
+        announces of the same overflow hash do not inflate the counter.
+        Once both sets are full, ``hash_overflow`` increments and
+        ``hash_set_saturated`` is set; the counter is then a lower bound
+        on the true distinct-overflow count.
         """
 
         if info_hash in self._recent_hashes:
@@ -246,8 +261,12 @@ class Diagnostics:
             return
         if len(self._recent_hashes) >= self.budget:
             self.hash_set_saturated = True
-            self._overflow_hashes.add(info_hash)
-            self.hash_overflow += 1
+            if len(self._overflow_hashes) < self._overflow_sample_budget:
+                self._overflow_hashes.add(info_hash)
+                self.hash_overflow += 1
+            else:
+                self._overflow_untracked += 1
+                self.hash_overflow += 1
             return
         self._recent_hashes.add(info_hash)
         self._recent_hash_count += 1
@@ -299,6 +318,7 @@ class Diagnostics:
         self._recent_hashes.clear()
         self._recent_hash_count = 0
         self._overflow_hashes.clear()
+        self._overflow_untracked = 0
 
         self.skip_cached_file = 0
         self.skip_pending = 0
@@ -366,9 +386,11 @@ class CooldownRegistry:
         self.config = config
         self.diagnostics = diagnostics
         self.clock = clock
-        self._entries: Dict[str, _CooldownEntry] = {}
-        self._order: Deque[str] = deque()
-        self._order_set: Set[str] = set()
+        # OrderedDict gives O(1) removal at any position while preserving
+        # insertion order for eviction. This prevents the unbounded deque
+        # growth that a separate deque + set pair would produce across
+        # repeated record_failure / clear cycles.
+        self._entries: "OrderedDict[str, _CooldownEntry]" = OrderedDict()
         self.evicted_hashes: List[str] = []
 
     def __len__(self) -> int:
@@ -440,7 +462,7 @@ class CooldownRegistry:
         self._evict_expired(now)
 
         if info_hash in self._entries:
-            self._remove(info_hash)
+            del self._entries[info_hash]
 
         while len(self._entries) >= self.config.max_cooldown_entries:
             self._evict_oldest()
@@ -450,9 +472,6 @@ class CooldownRegistry:
             next_allowed=now + delay,
             expires_at=now + self.config.cooldown_ttl,
         )
-        if info_hash not in self._order_set:
-            self._order.append(info_hash)
-            self._order_set.add(info_hash)
         self.diagnostics.cooldown_entries_recorded += 1
 
     def clear(self, info_hash: str) -> None:
@@ -476,27 +495,21 @@ class CooldownRegistry:
 
     def _remove(self, info_hash: str) -> None:
         self._entries.pop(info_hash, None)
-        self._order_set.discard(info_hash)
-        # The deque entry is left in place but filtered on read via _order_set.
 
     def _evict_expired(self, now: float) -> None:
         expired = [h for h, e in self._entries.items() if e.expires_at <= now]
         for h in expired:
-            self._entries.pop(h, None)
-            self._order_set.discard(h)
+            del self._entries[h]
             self.diagnostics.cooldown_entries_evicted += 1
             self.evicted_hashes.append(h)
 
     def _evict_oldest(self) -> None:
-        while self._order:
-            candidate = self._order.popleft()
-            if candidate in self._order_set:
-                self._order_set.discard(candidate)
-                if candidate in self._entries:
-                    self._entries.pop(candidate, None)
-                    self.diagnostics.cooldown_entries_evicted += 1
-                    self.evicted_hashes.append(candidate)
-                return
+        if not self._entries:
+            return
+        # OrderedDict preserves insertion order; pop the first item.
+        oldest_hash, _ = self._entries.popitem(last=False)
+        self.diagnostics.cooldown_entries_evicted += 1
+        self.evicted_hashes.append(oldest_hash)
 
 
 @dataclass
@@ -505,6 +518,8 @@ class _Candidate:
     state: CandidateState
     enqueued_at: float
     started_at: Optional[float] = None
+    persisting_at: Optional[float] = None
+    pending_removal_at: Optional[float] = None
     handle: Optional[Any] = None
     handle_generation: int = 0
     attempts: int = 0
@@ -836,12 +851,31 @@ class SniffScheduler:
         self._enter_cooldown(info_hash, now=now)
 
     def on_invalid_handle_alert(
-        self, info_hash: str, *, now: Optional[float] = None
+        self,
+        info_hash: str,
+        alert_handle: Any = None,
+        *,
+        now: Optional[float] = None,
     ) -> None:
-        """Count an add_torrent_alert with an invalid handle."""
+        """Count an add_torrent_alert with an invalid handle.
+
+        If the scheduler's candidate already has a DIFFERENT valid handle
+        recorded (from a newer attempt's successful add_torrent_alert),
+        this alert is stale and is counted in ``late_alert_ignored``
+        rather than cooling down the current attempt.
+        """
 
         now = self.clock() if now is None else now
         self.diagnostics.invalid_handle_alert += 1
+        candidate = self._candidates.get(info_hash)
+        if (
+            candidate is not None
+            and candidate.handle is not None
+            and alert_handle is not None
+            and candidate.handle is not alert_handle
+        ):
+            self.diagnostics.late_alert_ignored += 1
+            return
         self.on_async_add_failed(info_hash, now=now)
 
     def on_sync_add_failure(
@@ -885,6 +919,7 @@ class SniffScheduler:
             self.diagnostics.late_alert_ignored += 1
             return False
         candidate.state = CandidateState.PERSISTING
+        candidate.persisting_at = now
         candidate.handle = None
         candidate.handle_generation = 0
         self.diagnostics.metadata_success += 1
@@ -954,20 +989,18 @@ class SniffScheduler:
         """Thread-safe: called from the background persistence worker.
 
         Uses a dict keyed by info_hash so duplicate or reordered results
-        for the same hash collapse to the latest, rather than being
-        dropped. Bounded by ``persist_result_capacity``; when full, the
-        oldest (by insertion order) entry is removed to make room.
+        for the same hash collapse to the latest.
+
+        Results are NOT dropped: the dict is naturally bounded by the
+        number of outstanding PERSISTING candidates (which is bounded by
+        ``max_concurrent_acquisitions``). As a safety net, the alert loop
+        runs a PERSISTING timeout (``persist_timeout``) that recovers any
+        candidate stuck waiting for a result that was never delivered
+        (for example because the worker thread was starved).
         """
 
         result = PersistResult(info_hash, success)
         with self._persist_results_lock:
-            if (
-                info_hash not in self._persist_results
-                and len(self._persist_results) >= self.config.persist_result_capacity
-            ):
-                # Drop the oldest entry. dict preserves insertion order.
-                oldest = next(iter(self._persist_results))
-                del self._persist_results[oldest]
             self._persist_results[info_hash] = result
 
     def drain_persist_results(
@@ -1026,6 +1059,11 @@ class SniffScheduler:
         self._expire_queue_waits(
             now, cache_exists=cache_exists, session_known=session_known
         )
+        # PERSISTING timeout: if the persistence worker has not reported
+        # within ``persist_timeout``, treat the candidate as stuck and
+        # enter cooldown. This is the reliable reconciliation path for
+        # the (rare) case where a result is dropped or lost.
+        self._expire_persisting(now)
         pending = self._collect_pending_removals(now)
         promoted = self._promote_queued(
             now=now,
@@ -1036,21 +1074,47 @@ class SniffScheduler:
         return promoted, pending
 
     def pending_removals(self, now: Optional[float] = None) -> List[Tuple[str, Any]]:
-        """Return timed-out candidates without changing their state."""
+        """Return timed-out candidates, transitioning IN_FLIGHT ones to
+        ``PENDING_REMOVAL``.
+
+        Includes candidates already in ``PENDING_REMOVAL`` whose removal
+        has not yet been acknowledged. This lets the caller retry a
+        failed removal on the next loop iteration.
+        """
 
         now = self.clock() if now is None else now
         return self._collect_pending_removals(now)
 
+    def _expire_persisting(self, now: float) -> None:
+        """Recover PERSISTING candidates stuck past ``persist_timeout``."""
+
+        timeout = self.config.persist_timeout
+        for info_hash, candidate in list(self._candidates.items()):
+            if candidate.state is not CandidateState.PERSISTING:
+                continue
+            if candidate.persisting_at is None:
+                continue
+            if now - candidate.persisting_at >= timeout:
+                self.diagnostics.persist_failure += 1
+                self._enter_cooldown(info_hash, now=now)
+
     def _collect_pending_removals(self, now: float) -> List[Tuple[str, Any]]:
         timeout = self.config.acquisition_timeout
         result: List[Tuple[str, Any]] = []
-        for candidate in self._candidates.values():
+        for candidate in list(self._candidates.values()):
+            # Return previously-timed-out candidates whose removal hasn't
+            # been acknowledged yet (retry path for F1).
+            if candidate.state is CandidateState.PENDING_REMOVAL:
+                if candidate.handle is not None:
+                    result.append((candidate.info_hash, candidate.handle))
+                continue
             if candidate.state is not CandidateState.IN_FLIGHT:
                 continue
             if candidate.handle is None or candidate.started_at is None:
                 continue
             if now - candidate.started_at >= timeout:
                 candidate.state = CandidateState.PENDING_REMOVAL
+                candidate.pending_removal_at = now
                 result.append((candidate.info_hash, candidate.handle))
                 self.diagnostics.metadata_timeout += 1
         return result

@@ -649,15 +649,20 @@ class PersistResultQueueTests(unittest.TestCase):
         # No counter should increment for a hash the scheduler no longer owns.
         self.assertEqual(scheduler.diagnostics.persist_success, 0)
 
-    def test_bounded_persist_result_dict(self):
-        scheduler, _ = make_scheduler(persist_result_capacity=4)
+    def test_persist_results_never_dropped(self):
+        """Every outstanding completion is kept until drained (F3 fix)."""
 
-        for i in range(20):
-            scheduler.enqueue_persist_result(f"{i:040d}", True)
+        scheduler, _ = make_scheduler()
+
+        # Enqueue many results from distinct hashes.
+        hashes = [f"{i:040d}" for i in range(20)]
+        for h in hashes:
+            scheduler.enqueue_persist_result(h, True)
 
         with scheduler._persist_results_lock:
             size = len(scheduler._persist_results)
-        self.assertLessEqual(size, scheduler.config.persist_result_capacity)
+        # All 20 results must be present; none dropped.
+        self.assertEqual(size, 20)
 
 
 # ---------------------------------------------------------------------------
@@ -1089,9 +1094,10 @@ class RegressionTests(unittest.TestCase):
             scheduler.on_async_add_failed(HASH_A, now=clock())
             clock.advance(0.2)  # past cooldown each time
 
-        # _order must not grow unboundedly: the registry only has one entry
-        # for HASH_A, and our deduplicated _order tracks it once.
-        self.assertEqual(len(scheduler.cooldowns._order_set), 1)
+        # The OrderedDict-backed registry must not grow unboundedly across
+        # clear/re-add cycles: after 50 record_failure / clear pairs the
+        # registry has at most one entry for HASH_A.
+        self.assertEqual(len(scheduler.cooldowns._entries), 1)
 
     # Finding 3: persist results must not be silently dropped.
     def test_f3_persist_results_latest_writer_wins(self):
@@ -1222,6 +1228,238 @@ class RegressionTests(unittest.TestCase):
 
         self.assertEqual(diag.hash_overflow, 2)
         self.assertTrue(diag.hash_set_saturated)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for second correction round (head 8a19de2)
+# ---------------------------------------------------------------------------
+
+class SecondRoundRegressionTests(unittest.TestCase):
+    """Verify fixes for the 5 findings on second review pass."""
+
+    # F3: persist results must never be dropped even with capacity=1.
+    def test_f3_two_hashes_with_capacity_one(self):
+        """With persist_result_capacity=1 (legacy config), two distinct
+        hashes that enter PERSISTING and report success must both be
+        drained successfully. No hash stays PERSISTING forever."""
+
+        scheduler, clock = make_scheduler(persist_result_capacity=1)
+
+        scheduler.on_announce(HASH_A, now=clock())
+        scheduler.on_announce(HASH_B, now=clock())
+        scheduler.on_metadata_received(HASH_A, now=clock())
+        scheduler.on_metadata_received(HASH_B, now=clock())
+
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PERSISTING)
+        self.assertEqual(scheduler.state_of(HASH_B), ss.CandidateState.PERSISTING)
+
+        # Both report success before drain.
+        scheduler.enqueue_persist_result(HASH_A, True)
+        scheduler.enqueue_persist_result(HASH_B, True)
+        scheduler.drain_persist_results(now=clock())
+
+        # Both must have been cleared.
+        self.assertIsNone(scheduler.state_of(HASH_A))
+        self.assertIsNone(scheduler.state_of(HASH_B))
+        self.assertEqual(scheduler.diagnostics.persist_success, 2)
+
+    # F3: PERSISTING timeout recovers stuck candidates.
+    def test_f3_persisting_timeout_recover(self):
+        """A candidate stuck in PERSISTING (result never delivered) is
+        recovered via persist_timeout."""
+
+        scheduler, clock = make_scheduler(persist_timeout=30.0)
+
+        scheduler.on_announce(HASH_A, now=clock())
+        scheduler.on_metadata_received(HASH_A, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PERSISTING)
+
+        # No result is ever enqueued; advance past persist_timeout.
+        clock.advance(31.0)
+        scheduler.tick(now=clock())
+
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+        self.assertEqual(scheduler.diagnostics.persist_failure, 1)
+
+    # F2: 1000 record_failure/clear cycles must not grow ordering.
+    def test_f2_thousand_clear_readd_cycles(self):
+        scheduler, clock = make_scheduler(
+            cooldown_base_seconds=0.1,
+            cooldown_jitter=0.0,
+            cooldown_ttl=100.0,
+        )
+
+        for _ in range(1000):
+            scheduler.on_announce(HASH_A, now=clock())
+            scheduler.on_async_add_failed(HASH_A, now=clock())
+            scheduler.cooldowns.clear(HASH_A)
+            clock.advance(0.2)
+
+        # Registry has zero entries (each was cleared); the underlying
+        # OrderedDict must not have accumulated 1000 tombstones.
+        self.assertEqual(len(scheduler.cooldowns._entries), 0)
+        # Internal memory should not grow unboundedly.
+        import sys
+        self.assertLess(sys.getsizeof(scheduler.cooldowns._entries), 10_000)
+
+    # F7: 1000 unique hashes with budget=2 must have bounded overflow set.
+    def test_f7_bounded_overflow_set(self):
+        diag = ss.Diagnostics(budget=2)
+
+        diag.observe_hash(HASH_A)
+        diag.observe_hash(HASH_B)
+        # Now drive 1000 more unique hashes through.
+        for i in range(1000):
+            diag.observe_hash(f"{i:040d}")
+
+        # Overflow set must stay bounded.
+        self.assertLessEqual(len(diag._overflow_hashes), diag._overflow_sample_budget)
+        # Counter still increments for every distinct overflow hash.
+        self.assertEqual(diag.hash_overflow, 1000)
+        self.assertTrue(diag.hash_set_saturated)
+
+    # F1: removal failure keeps PENDING_REMOVAL and retries.
+    def test_f1_removal_failure_retries(self):
+        scheduler, clock = make_scheduler(acquisition_timeout=5.0)
+
+        scheduler.on_announce(HASH_A, now=clock())
+        handle = SimpleNamespace(is_valid=lambda: True, remove_ok=False)
+        scheduler.on_add_started(HASH_A, handle, now=clock())
+        clock.advance(6.0)
+
+        # First pass: tick returns the handle.
+        _, pending = scheduler.tick(now=clock())
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PENDING_REMOVAL)
+
+        # Caller attempts removal but fails; does NOT ack.
+        removal_succeeded = False  # simulated failure
+        if not removal_succeeded:
+            # Candidate stays in PENDING_REMOVAL.
+            self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PENDING_REMOVAL)
+
+        # Second pass: pending_removals returns it again for retry.
+        pending = scheduler.pending_removals(clock())
+        self.assertEqual(len(pending), 1)
+
+        # Now caller succeeds; ack releases the slot.
+        scheduler.ack_handle_removed(HASH_A, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+        self.assertEqual(scheduler.in_flight_count(), 0)
+
+    # F4: old invalid alert cannot cool down a new attempt.
+    def test_f4_old_invalid_alert_does_not_cool_new_attempt(self):
+        scheduler, clock = make_scheduler(acquisition_timeout=5.0)
+
+        # First attempt starts.
+        scheduler.on_announce(HASH_A, now=clock())
+        handle_new = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle_new, now=clock())
+
+        # A different (old) invalid handle arrives; the candidate already
+        # has handle_new, so the old alert is rejected.
+        handle_old = SimpleNamespace(is_valid=lambda: False)
+        scheduler.on_invalid_handle_alert(HASH_A, alert_handle=handle_old, now=clock())
+
+        # The new attempt is still in flight.
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.diagnostics.late_alert_ignored, 1)
+        self.assertIs(scheduler.handle_for(HASH_A), handle_new)
+
+    # F4 integration: stale metadata alert does not queue persistence.
+    def test_f4_stale_metadata_alert_does_not_queue_persistence(self):
+        """handle_alert_metadata_received validates ownership BEFORE
+        queueing persistence. A stale alert from a previous attempt does
+        not produce a METADATA_QUEUE entry."""
+
+        import app as app_module
+        import queue as queue_module
+
+        tmpdir_obj = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir_obj.cleanup)
+
+        metadata_queue = queue_module.Queue(maxsize=20)
+        torrents = app_module.TTLDict(maxsize=100, ttl=600)
+        live_handles = app_module.LiveHandles(maxsize=100)
+        scheduler, clock = make_scheduler(acquisition_timeout=5.0)
+        removed = []
+        session = SimpleNamespace(
+            async_add_torrent=lambda p: None,
+            remove_torrent=lambda h: removed.append(h),
+        )
+
+        class FakeLT:
+            dht_pkt_alert = type("dht_pkt_alert", (), {})
+            add_torrent_alert = type("add_torrent_alert", (), {})
+            metadata_received_alert = type("metadata_received_alert", (), {})
+
+        class FakeHandle:
+            def __init__(self, info_hash):
+                self.info_hash = info_hash
+                self._valid = True
+                self.torrent_file = SimpleNamespace(
+                    info_hashes=SimpleNamespace(
+                        has_v1=lambda: True, has_v2=lambda: False, v1=info_hash,
+                    )
+                )
+                self.paused = False
+
+            def is_valid(self):
+                return self._valid
+
+            def status(self):
+                return SimpleNamespace(
+                    torrent_file=self.torrent_file,
+                    info_hashes=SimpleNamespace(
+                        has_v1=lambda: True, has_v2=lambda: False, v1=self.info_hash,
+                    ),
+                )
+
+            def pause(self):
+                self.paused = True
+
+        patches = [
+            patch.object(app_module, "OPTIONS", SimpleNamespace(download_mode=False), create=True),
+            patch.object(app_module, "SESSION", session, create=True),
+            patch.object(app_module, "TORRENTS", torrents, create=True),
+            patch.object(app_module, "LIVE_HANDLES", live_handles),
+            patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+            patch.object(app_module, "TORRENT_DIR", tmpdir_obj.name),
+            patch.object(app_module, "TRACKERS", [], create=True),
+            patch.object(app_module, "METADATA_QUEUE", metadata_queue),
+            patch.object(app_module, "lt", FakeLT),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        # Simulate first attempt: in flight, has handle_new.
+        scheduler.on_announce(HASH_A, now=clock())
+        handle_new = FakeHandle(HASH_A)
+        scheduler.on_add_started(HASH_A, handle_new, now=clock())
+
+        # Simulate timeout, ack, cooldown expiry.
+        clock.advance(100.0)
+        _, pending = scheduler.tick(now=clock())
+        scheduler.ack_handle_removed(HASH_A, now=clock())
+        clock.advance(100.0)
+
+        # New attempt starts with handle_newer.
+        scheduler.on_announce(HASH_A, now=clock())
+        handle_newer = FakeHandle(HASH_A)
+        scheduler.on_add_started(HASH_A, handle_newer, now=clock())
+
+        # Stale metadata alert from old attempt arrives.
+        stale_alert = FakeLT.metadata_received_alert()
+        stale_alert.handle = handle_new  # OLD handle
+
+        app_module.handle_alert_metadata_received(stale_alert)
+
+        # No persistence was queued.
+        self.assertTrue(metadata_queue.empty())
+        # The new attempt is still in flight.
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.diagnostics.late_alert_ignored, 1)
 
 
 if __name__ == "__main__":

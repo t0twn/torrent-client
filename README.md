@@ -73,6 +73,7 @@ Supported scheduler environment settings:
 | `SNIFF_START_RATE_WINDOW` | `1.0` | Rate window in seconds |
 | `SNIFF_ACQUISITION_TIMEOUT` | `120.0` | Seconds before an in-flight acquisition is timed out |
 | `SNIFF_QUEUE_WAIT_TIMEOUT` | `300.0` | Seconds a candidate may wait in queue before cooldown |
+| `SNIFF_PERSIST_TIMEOUT` | `600.0` | Seconds a PERSISTING candidate waits before recovery timeout |
 | `SNIFF_COOLDOWN_BASE` | `30.0` | Initial retry delay after failure (seconds) |
 | `SNIFF_COOLDOWN_MAX` | `3600.0` | Maximum retry delay (seconds) |
 | `SNIFF_COOLDOWN_MULTIPLIER` | `2.0` | Exponential backoff multiplier |
