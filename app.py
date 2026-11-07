@@ -571,7 +571,7 @@ def add_torrent(torrent, *, session=None, registry=None, live_handles=None, opti
         # Reserve capacity before adding to libtorrent. Assignment cannot
         # report a full TTLDict, so this must use the explicit API.
         if not registry.add_if_absent(info_hash_str, None):
-            logging.debug("torrent duplicate or capacity reached: %s", info_hash_str)
+            logging.debug("torrent duplicate or capacity reached")
             return False
         reserved_info_hash = info_hash_str
         if len(info_hash_str) == 40:
@@ -619,6 +619,11 @@ def add_torrent(torrent, *, session=None, registry=None, live_handles=None, opti
         if not options.download_mode:
             tp.flags |= lt.torrent_flags.upload_mode
         session.async_add_torrent(tp)
+        # Tell the scheduler that async_add_torrent was submitted for this
+        # attempt. The timestamp is used to disambiguate stale alerts
+        # that arrive before the handle is registered via on_add_started.
+        if not options.download_mode and SNIFF_SCHEDULER is not None and reserved_info_hash is not None:
+            SNIFF_SCHEDULER.on_add_torrent_called(reserved_info_hash)
     except Exception:
         if reserved_info_hash is not None:
             try:
@@ -847,16 +852,23 @@ def persist_torrent_metadata(torrent_file, info_hash):
         with open(cache_file, "wb") as f:
             f.write(lt.bencode(torrent_obj.generate()))
 
-        logging.info("torrent cached: %s", info_hash)
+        logging.debug("torrent cached to .torrent file")
         return True
     except Exception as e:
-        logging.warning("failed to persist torrent %s: %s", info_hash, e)
+        logging.warning("failed to persist torrent metadata: %s", e)
         return False
 
 
 def metadata_worker():
     while True:
-        torrent_file, info_hash = METADATA_QUEUE.get()
+        item = METADATA_QUEUE.get()
+        # Backwards compatibility: older code queued (torrent_file, info_hash);
+        # newer code queues (torrent_file, info_hash, job_id).
+        if len(item) == 3:
+            torrent_file, info_hash, job_id = item
+        else:
+            torrent_file, info_hash = item
+            job_id = 0
         try:
             success = persist_torrent_metadata(torrent_file, info_hash)
         finally:
@@ -865,7 +877,7 @@ def metadata_worker():
             except KeyError:
                 pass
             if SNIFF_SCHEDULER is not None:
-                SNIFF_SCHEDULER.enqueue_persist_result(info_hash, success)
+                SNIFF_SCHEDULER.enqueue_persist_result(info_hash, success, job_id)
             METADATA_QUEUE.task_done()
 
 
@@ -902,49 +914,56 @@ def handle_alert_metadata_received(a):
     # torrent_file missing: metadata acquisition produced nothing usable.
     if torrent_file is None:
         if scheduler is not None and info_hash is not None:
-            scheduler.on_metadata_missing(info_hash)
-        _teardown_metadata_handle(handle, info_hash)
+            # Validate handle ownership before tearing down. A stale
+            # missing-metadata alert from an old attempt must not cancel
+            # a newer attempt's in-flight acquisition.
+            scheduler.on_metadata_missing(info_hash, handle=handle)
+        _teardown_metadata_handle_by_handle(handle, info_hash)
         return
 
     if info_hash is None:
         logging.warning("dropping metadata with no valid info-hash")
-        _teardown_metadata_handle(handle, None)
+        _teardown_metadata_handle_by_handle(handle, None)
         return
 
-    # Ownership check BEFORE any side effects. A stale metadata alert
-    # from a previous timed-out attempt must not queue persistence,
-    # reserve TORRENTS capacity, or mutate scheduler state. The
-    # scheduler validates the handle identity against its recorded
-    # candidate; only when it accepts do we proceed.
-    scheduler_accepted = False
+    # Determine whether the scheduler owns this hash. If it does, the
+    # alert must pass handle validation. If it doesn't (e.g. the hash
+    # was added via management API), we proceed with the legacy
+    # persistence path.
+    scheduler_owned = False
+    scheduler_job_id = 0
     scheduler_queue_full = False
     if scheduler is not None:
-        scheduler_accepted = scheduler.on_metadata_received(info_hash, handle=handle)
-        if not scheduler_accepted:
-            # Either the scheduler doesn't own this hash (another path
-            # added it) or a stale alert arrived. Clean up the handle
-            # without queueing persistence.
-            _teardown_metadata_handle(handle, info_hash)
-            return
-    else:
-        # No scheduler: proceed with the pre-scheduler semantics (direct
-        # TORRENTS reservation and queueing).
-        scheduler_accepted = True
+        candidate_state = scheduler.state_of(info_hash)
+        if candidate_state is not None:
+            # Scheduler owns this hash; validate handle ownership.
+            job_id = scheduler.on_metadata_received(info_hash, handle=handle)
+            if job_id is None:
+                # Stale alert: handle didn't match. Don't queue
+                # persistence; just tear down the handle (but only if
+                # this handle belongs to us).
+                _teardown_metadata_handle_by_handle(handle, info_hash)
+                return
+            scheduler_owned = True
+            scheduler_job_id = job_id
+        # else: scheduler doesn't own this hash (management API case);
+        # proceed with legacy persistence.
+    # If no scheduler, also proceed with legacy persistence.
 
     queued = False
     if not TORRENTS.put(info_hash, None):
-        logging.warning("torrent capacity reached, dropping metadata: %s", info_hash)
+        logging.warning("torrent capacity reached, dropping metadata")
     else:
         try:
-            METADATA_QUEUE.put_nowait((torrent_file, info_hash))
+            METADATA_QUEUE.put_nowait((torrent_file, info_hash, scheduler_job_id))
             queued = True
         except queue.Full:
-            logging.warning("metadata queue full, dropping torrent: %s", info_hash)
+            logging.warning("metadata queue full, dropping torrent")
 
     if not queued:
         # Persistence queue full or TORRENTS full: release the
-        # scheduler's slot and enter cooldown.
-        if scheduler is not None:
+        # scheduler's slot and enter cooldown (only if we owned it).
+        if scheduler_owned:
             scheduler.on_persist_queue_full(info_hash)
             scheduler_queue_full = True
         try:
@@ -954,23 +973,26 @@ def handle_alert_metadata_received(a):
 
     # Keep a TTL reservation while the background worker persists this hash.
     if not queued or scheduler_queue_full:
-        _teardown_metadata_handle(handle, info_hash)
+        _teardown_metadata_handle_by_handle(handle, info_hash)
     else:
         SESSION.remove_torrent(handle)
         if LIVE_HANDLES is not None:
             LIVE_HANDLES.discard(info_hash)
 
 
-def _teardown_metadata_handle(handle, info_hash):
-    """Remove the handle from the session and tracking maps.
+def _teardown_metadata_handle_by_handle(handle, info_hash):
+    """Remove a handle from the session.
 
-    Shared by the metadata-received path when no persistence job was
-    queued. Kept as a helper so the two branches stay symmetric.
+    Only discards from LIVE_HANDLES when the handle reference in the
+    registry matches this handle, so a stale alert cannot discard a
+    newer handle that was registered for the same info_hash.
     """
 
     SESSION.remove_torrent(handle)
     if info_hash is not None and LIVE_HANDLES is not None:
-        LIVE_HANDLES.discard(info_hash)
+        # Only discard if LIVE_HANDLES still points at this handle.
+        if LIVE_HANDLES.get(info_hash) is handle:
+            LIVE_HANDLES.discard(info_hash)
 
 
 def _seconds_until_next_cleanup(target_hour=3):
@@ -1159,7 +1181,7 @@ def handle_alert_state_update(a):
                 continue
             info_hash = get_info_hash(s.info_hashes)
             if not add_handle_torrents(s.handle, info_hash):
-                logging.warning("torrent capacity reached, removing %s", info_hash)
+                logging.warning("torrent capacity reached, removing torrent")
                 SESSION.remove_torrent(s.handle)
 
 
@@ -1378,7 +1400,7 @@ def alert_handle():
         try:
             handle.save_resume_data()
         except Exception as e:
-            logging.error("failed to request resume data for %s: %s", info_hash, e)
+            logging.error("failed to request resume data: %s", e)
             del_handle_torrents(handle, info_hash)
         else:
             pending_resume.add(info_hash)
