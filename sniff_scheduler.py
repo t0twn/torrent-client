@@ -114,7 +114,6 @@ class SniffSchedulerConfig:
     diagnostics_interval: float = 60.0
     distinct_hash_budget: int = 256
     max_candidates: int = 2048
-    persist_result_capacity: int = 256
     queue_drop_cooldown_seconds: float = 30.0
 
     def validate(self) -> None:
@@ -134,7 +133,6 @@ class SniffSchedulerConfig:
             "diagnostics_interval",
             "distinct_hash_budget",
             "max_candidates",
-            "persist_result_capacity",
             "queue_drop_cooldown_seconds",
         )
         for name in positive:
@@ -169,7 +167,6 @@ def config_from_environment() -> SniffSchedulerConfig:
         diagnostics_interval=_env_float("SNIFF_DIAGNOSTICS_INTERVAL", 60.0),
         distinct_hash_budget=_env_int("SNIFF_DISTINCT_HASH_BUDGET", 256),
         max_candidates=_env_int("SNIFF_MAX_CANDIDATES", 2048),
-        persist_result_capacity=_env_int("SNIFF_PERSIST_RESULT_CAPACITY", 256),
         queue_drop_cooldown_seconds=_env_float("SNIFF_QUEUE_DROP_COOLDOWN", 30.0),
     )
 
@@ -523,16 +520,29 @@ class _Candidate:
     handle: Optional[Any] = None
     handle_generation: int = 0
     attempts: int = 0
+    # Unique per-PERSISTING-transition identifier so a stale result from
+    # an earlier attempt cannot settle the current attempt.
+    persisting_job_id: int = 0
+    # Time at which async_add_torrent was last called for this attempt.
+    # Used to disambiguate stale alerts that arrive after the new
+    # attempt's handle has not yet been registered.
+    add_torrent_called_at: Optional[float] = None
 
 
 class PersistResult:
-    """Cross-thread result from the persistence worker."""
+    """Cross-thread result from the persistence worker.
 
-    __slots__ = ("info_hash", "success")
+    Carries ``job_id`` so the alert-loop drain can match the result to
+    the specific attempt it belongs to; a stale result from an earlier
+    attempt that timed out cannot settle a newer attempt.
+    """
 
-    def __init__(self, info_hash: str, success: bool):
+    __slots__ = ("info_hash", "success", "job_id")
+
+    def __init__(self, info_hash: str, success: bool, job_id: int = 0):
         self.info_hash = info_hash
         self.success = success
+        self.job_id = job_id
 
 
 class SniffScheduler:
@@ -579,11 +589,13 @@ class SniffScheduler:
         self._candidates: Dict[str, _Candidate] = {}
         self._queue: Deque[str] = deque()
         self._start_times: Deque[float] = deque()
-        # Latest-writer-wins dict: the worker may report a result before a
-        # duplicate result for the same hash; only the latest matters.
-        self._persist_results: Dict[str, PersistResult] = {}
+        # Keyed by (info_hash, job_id): the worker may report a result
+        # before a duplicate result for the same hash; only the latest
+        # with the matching job_id matters.
+        self._persist_results: Dict[Tuple[str, int], PersistResult] = {}
         self._persist_results_lock = threading.Lock()
         self._generation = 0
+        self._persisting_job_counter = 0
         self._last_diagnostics_at: Optional[float] = None
 
     # ------------------------------------------------------------------
@@ -890,45 +902,77 @@ class SniffScheduler:
             return
         self._enter_cooldown(info_hash, now=now)
 
+    def on_add_torrent_called(
+        self, info_hash: str, *, now: Optional[float] = None
+    ) -> None:
+        """Record that async_add_torrent was submitted for a candidate.
+
+        Called from the add_torrent wrapper after async_add_torrent has
+        been successfully submitted. The timestamp is used to
+        disambiguate stale alerts that arrive for candidates whose
+        handle has not yet been registered via ``on_add_started``.
+        """
+
+        now = self.clock() if now is None else now
+        candidate = self._candidates.get(info_hash)
+        if candidate is None or candidate.state is not CandidateState.IN_FLIGHT:
+            return
+        candidate.add_torrent_called_at = now
+
     def on_metadata_received(
         self,
         info_hash: str,
         handle: Any = None,
         *,
         now: Optional[float] = None,
-    ) -> bool:
+    ) -> Optional[int]:
         """Transition to PERSISTING.
 
         When ``handle`` is supplied, it must match the candidate's
         recorded handle (by identity); otherwise the alert is treated as
-        stale and counted in ``late_alert_ignored``. Returns True when
-        the scheduler owns the hash and transitioned it to PERSISTING.
+        stale and counted in ``late_alert_ignored``.
+
+        Returns the new ``persisting_job_id`` on success, or ``None`` if
+        the alert was rejected. The caller passes this job_id through the
+        metadata queue and into the persistence worker so the result can
+        be matched back to this specific attempt.
         """
 
         now = self.clock() if now is None else now
         candidate = self._candidates.get(info_hash)
         if candidate is None:
-            return False
+            return None
         if candidate.state is not CandidateState.IN_FLIGHT:
             self.diagnostics.late_alert_ignored += 1
-            return False
+            return None
         if handle is not None and candidate.handle is not None and candidate.handle is not handle:
             # Old handle from a previous attempt that has already timed
             # out (and whose removal has been acked) must not transition
             # the new attempt to PERSISTING.
             self.diagnostics.late_alert_ignored += 1
-            return False
+            return None
+        self._persisting_job_counter += 1
         candidate.state = CandidateState.PERSISTING
         candidate.persisting_at = now
+        candidate.persisting_job_id = self._persisting_job_counter
         candidate.handle = None
         candidate.handle_generation = 0
         self.diagnostics.metadata_success += 1
-        return True
+        return candidate.persisting_job_id
 
     def on_metadata_missing(
-        self, info_hash: str, *, now: Optional[float] = None
+        self,
+        info_hash: str,
+        handle: Any = None,
+        *,
+        now: Optional[float] = None,
     ) -> bool:
-        """metadata_received fired but ``torrent_file`` was None."""
+        """metadata_received fired but ``torrent_file`` was None.
+
+        When ``handle`` is supplied, validates ownership against the
+        candidate's recorded handle. A stale alert from a previous
+        attempt is rejected and counted in ``late_alert_ignored``.
+        """
 
         now = self.clock() if now is None else now
         self.diagnostics.metadata_missing += 1
@@ -936,6 +980,9 @@ class SniffScheduler:
         if candidate is None:
             return False
         if candidate.state is not CandidateState.IN_FLIGHT:
+            self.diagnostics.late_alert_ignored += 1
+            return False
+        if handle is not None and candidate.handle is not None and candidate.handle is not handle:
             self.diagnostics.late_alert_ignored += 1
             return False
         self._enter_cooldown(info_hash, now=now)
@@ -985,47 +1032,54 @@ class SniffScheduler:
     # Persistence result boundary
     # ------------------------------------------------------------------
 
-    def enqueue_persist_result(self, info_hash: str, success: bool) -> None:
+    def enqueue_persist_result(
+        self, info_hash: str, success: bool, job_id: int = 0
+    ) -> None:
         """Thread-safe: called from the background persistence worker.
 
-        Uses a dict keyed by info_hash so duplicate or reordered results
-        for the same hash collapse to the latest.
-
-        Results are NOT dropped: the dict is naturally bounded by the
-        number of outstanding PERSISTING candidates (which is bounded by
-        ``max_concurrent_acquisitions``). As a safety net, the alert loop
-        runs a PERSISTING timeout (``persist_timeout``) that recovers any
-        candidate stuck waiting for a result that was never delivered
-        (for example because the worker thread was starved).
+        Results are keyed by (info_hash, job_id). A result with an old
+        job_id is ignored when the candidate's current persisting_job_id
+        differs, so a stale result from an earlier timed-out attempt
+        cannot settle a newer attempt.
         """
 
-        result = PersistResult(info_hash, success)
+        result = PersistResult(info_hash, success, job_id)
         with self._persist_results_lock:
-            self._persist_results[info_hash] = result
+            key = (info_hash, job_id)
+            self._persist_results[key] = result
 
     def drain_persist_results(
         self,
         *,
         now: Optional[float] = None,
     ) -> None:
-        """Apply pending persist results on the alert-loop thread."""
+        """Apply pending persist results on the alert-loop thread.
+
+        Each result is matched to the candidate's current
+        ``persisting_job_id``. A stale result (from an earlier attempt
+        that timed out and was reused for a newer attempt) is discarded
+        so it cannot settle the new attempt.
+        """
 
         now = self.clock() if now is None else now
         with self._persist_results_lock:
-            results = list(self._persist_results.items())
+            results = list(self._persist_results.values())
             self._persist_results.clear()
 
-        for info_hash, result in results:
-            candidate = self._candidates.get(info_hash)
+        for result in results:
+            candidate = self._candidates.get(result.info_hash)
             if candidate is None or candidate.state is not CandidateState.PERSISTING:
+                continue
+            if result.job_id and candidate.persisting_job_id != result.job_id:
+                # Stale result from an earlier attempt.
                 continue
             if result.success:
                 self.diagnostics.persist_success += 1
-                self.cooldowns.clear(info_hash)
-                self._clear_candidate(info_hash)
+                self.cooldowns.clear(result.info_hash)
+                self._clear_candidate(result.info_hash)
             else:
                 self.diagnostics.persist_failure += 1
-                self._enter_cooldown(info_hash, now=now)
+                self._enter_cooldown(result.info_hash, now=now)
 
     # ------------------------------------------------------------------
     # Periodic maintenance
@@ -1101,22 +1155,34 @@ class SniffScheduler:
     def _collect_pending_removals(self, now: float) -> List[Tuple[str, Any]]:
         timeout = self.config.acquisition_timeout
         result: List[Tuple[str, Any]] = []
-        for candidate in list(self._candidates.values()):
+        for info_hash, candidate in list(self._candidates.items()):
             # Return previously-timed-out candidates whose removal hasn't
             # been acknowledged yet (retry path for F1).
             if candidate.state is CandidateState.PENDING_REMOVAL:
                 if candidate.handle is not None:
-                    result.append((candidate.info_hash, candidate.handle))
+                    result.append((info_hash, candidate.handle))
                 continue
             if candidate.state is not CandidateState.IN_FLIGHT:
                 continue
-            if candidate.handle is None or candidate.started_at is None:
+            if candidate.started_at is None:
                 continue
-            if now - candidate.started_at >= timeout:
+            if now - candidate.started_at < timeout:
+                continue
+            # Timed out. Two cases:
+            # 1. Has a handle: return for caller to remove from session
+            #    (slot released via ack_handle_removed).
+            # 2. No handle (async_add_torrent called but add_torrent_alert
+            #    never arrived or was lost): release slot directly, enter
+            #    cooldown. This prevents a lost alert from permanently
+            #    occupying an in-flight slot.
+            if candidate.handle is not None:
                 candidate.state = CandidateState.PENDING_REMOVAL
                 candidate.pending_removal_at = now
-                result.append((candidate.info_hash, candidate.handle))
+                result.append((info_hash, candidate.handle))
                 self.diagnostics.metadata_timeout += 1
+            else:
+                self.diagnostics.metadata_timeout += 1
+                self._enter_cooldown(info_hash, now=now)
         return result
 
     def ack_handle_removed(self, info_hash: str, *, now: Optional[float] = None) -> None:

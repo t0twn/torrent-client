@@ -83,7 +83,6 @@ Supported scheduler environment settings:
 | `SNIFF_DIAGNOSTICS_INTERVAL` | `60.0` | Seconds between aggregate log lines |
 | `SNIFF_DISTINCT_HASH_BUDGET` | `256` | Distinct hash tracking budget per diagnostics window |
 | `SNIFF_MAX_CANDIDATES` | `2048` | Total cap on scheduler candidate records (queued + in-flight + cooldown) |
-| `SNIFF_PERSIST_RESULT_CAPACITY` | `256` | Max outstanding persistence results held before oldest-wins eviction |
 | `SNIFF_QUEUE_DROP_COOLDOWN` | `30.0` | Seconds of bounded overload suppression after a queue-full drop |
 
 All values must be positive. Invalid values fail fast at startup with a clear error message.
@@ -106,7 +105,7 @@ sniff-scheduler announce_peer_received=142 announce_peer_invalid=0
   queued=0 in_flight=3 persisting=1 cooldowns=2
 ```
 
-Info-hashes are never logged or labelled individually. All scheduler logging in the sniff path is hash-agnostic; the periodic `sniff-scheduler` line is the only operator-facing output for this subsystem. `distinct_hashes` is a lower bound once `hash_set_saturated` becomes `true` within a window; `hash_overflow` counts how many **distinct** hashes arrived beyond the tracking budget (repeat announces of an overflow hash do not inflate the count within the same window).
+Info-hashes are never included in the periodic `sniff-scheduler` diagnostic line or used as metric labels. All scheduler logging in the sniff path is hash-agnostic. Other operational log lines in the process (e.g. `persist_torrent_metadata` success/failure, resume data failures) are also hash-free in sniff mode; any per-hash log lines come from non-sniff paths (download-mode resume data, management API) and are not emitted during pure sniff-mode operation.
 
 `announce_peer_received` counts valid DHT `announce_peer` messages after decode and info-hash extraction. `announce_peer_invalid` counts only packets that failed decode or whose info-hash field was missing/unparsable; well-formed DHT queries that are not `announce_peer` are silently ignored (they are normal DHT traffic, not announces). The scheduler's skip / drop counters cover every non-admitted announce; the sum of all skip, drop, and admitted counters equals `announce_peer_received` minus `announce_peer_invalid` minus `skip_cached_file`.
 
@@ -137,7 +136,7 @@ The scheduler's queue, in-flight set, and cooldown registry are in-memory only. 
 
 The scheduler does not enforce a byte budget itself; the counters above provide the inputs an operator needs to enforce one at the deployment layer. A concrete policy proposal for a future extension:
 
-- **Measurement point.** Use cgroup v2 `io.stat` / `memory.current` or orchestrator pod counters for the process; `ip -s link` for the host NIC. Do not derive bytes from `announce_peer_received` or `admitted_started`.
+- **Measurement point.** Use host / container network counters: `ip -s link` on the host NIC, or the orchestrator's pod/container network accounting (Kubernetes `container_network_receive_bytes_total` / `container_network_transmit_bytes_total` via cAdvisor, or the cloud provider's per-instance network metrics). cgroup v2 does not currently expose per-cgroup network byte counters — `io.stat` measures block I/O and `memory.current` measures memory, neither of which is network traffic. Do not derive bytes from `announce_peer_received` or `admitted_started`.
 - **Window.** Rolling 1-hour and 24-hour windows evaluated in the alert loop's diagnostics tick. The scheduler records `admitted_started` per window; the deployment layer records bytes per window.
 - **Stopping new starts.** When the rolling window exceeds the configured budget, a future flag could set `SNIFF_MAX_STARTS_PER_SECOND=0` and let in-flight acquisitions finish naturally. In-flight tasks at that point are **not** aborted: they complete normally and their results are still persisted.
 - **Restart continuity.** Budget counters are not durable. After restart, the window resets. The `.torrent` cache continues to suppress reacquisition of cached hashes regardless of budget.
