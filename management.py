@@ -428,32 +428,53 @@ def _is_loopback_literal(host: str) -> bool:
         return False
 
 
-def _loopback_equivalent(a: str, b: str) -> bool:
-    """True if both hosts are loopback (any loopback name is equivalent to any other)."""
-    a_loopback = _is_loopback_literal(a)
-    b_loopback = _is_loopback_literal(b)
-    if a_loopback and b_loopback:
-        return True
-    if a_loopback != b_loopback:
-        return False
-    return a.lower().strip("[]") == b.lower().strip("[]")
+def _normalize_host_for_comparison(host: str) -> str:
+    """Normalize a host for exact string comparison.
+
+    Lowercases and strips IPv6 brackets. Two hosts that normalize to the
+    same string are considered the same origin for the same-origin check.
+    This does NOT equate different loopback IPs (e.g. 127.0.0.1 vs 127.0.0.2).
+    """
+    host = (host or "").strip().lower()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host
 
 
 def _parse_origin(origin: str) -> tuple[str, str, int] | None:
     """Parse an Origin header into (scheme, host, port).
 
-    Returns None when the Origin is malformed or has an unsupported scheme.
+    Returns None when the Origin is malformed, has an unsupported scheme,
+    contains a path or userinfo, or has an invalid port. Any parser error
+    is caught and treated as malformed — callers never see an exception.
     """
     if not origin:
         return None
-    parsed = urllib.parse.urlsplit(origin)
+    try:
+        parsed = urllib.parse.urlsplit(origin)
+    except ValueError:
+        return None
     scheme = (parsed.scheme or "").lower()
     if scheme not in ("http", "https"):
         return None
-    host = (parsed.hostname or "").lower()
+    # Reject Origins with userinfo or path components — a valid origin is
+    # strictly scheme://host[:port] with nothing else.
+    if parsed.username or parsed.password:
+        return None
+    if parsed.path and parsed.path not in ("", "/"):
+        return None
+    if parsed.query or parsed.fragment:
+        return None
+    try:
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return None
     if not host:
         return None
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
     if port is None:
         port = 443 if scheme == "https" else 80
     return scheme, host, port
@@ -570,11 +591,16 @@ def make_handler(dispatcher: CommandDispatcher, token: str) -> type[BaseHTTPRequ
 
             When the request carries an Origin header (browsers on cross-site
             requests and on POST), the Origin must exactly match the target
-            origin — same scheme (always http for this plain-HTTP server),
-            loopback-equivalent host, and identical port. This blocks a page
-            served from a different loopback port or scheme from mutating
-            torrents via a simple text/plain POST that would otherwise bypass
-            CORS preflight.
+            origin under a defined normalization — same scheme (always http
+            for this plain-HTTP server), identical port, and the Origin host
+            must normalize to the same string as the validated request Host
+            host. Different loopback IPs (e.g. 127.0.0.1 vs 127.0.0.2) are
+            NOT considered the same origin even though both are loopback.
+
+            The comparison uses the validated request Host, not the bind
+            address, so a valid same-origin browser request on a wildcard
+            listener (0.0.0.0 / ::) works as long as the Host and Origin
+            identify the same loopback endpoint.
 
             When no Origin is present (native CLI shape), the Host header
             must still identify a loopback endpoint with a well-formed port
@@ -605,7 +631,7 @@ def make_handler(dispatcher: CommandDispatcher, token: str) -> type[BaseHTTPRequ
             if origin is not None:
                 parsed = _parse_origin(origin)
                 if parsed is None:
-                    # Malformed Origin (null, bad scheme, missing host, etc.)
+                    # Malformed Origin (null, bad scheme, path, userinfo, bad port)
                     return False
                 scheme, origin_host, origin_port = parsed
                 # Scheme must be http (this is a plain-HTTP server)
@@ -614,9 +640,12 @@ def make_handler(dispatcher: CommandDispatcher, token: str) -> type[BaseHTTPRequ
                 # Port must match exactly
                 if origin_port != server_port:
                     return False
-                # Host must be loopback-equivalent to the bound address
-                server_host = self.server.server_address[0]
-                if not _loopback_equivalent(origin_host, server_host):
+                # Origin host must match the validated request Host host exactly
+                # under normalization — NOT loopback-equivalence. Different
+                # loopback IPs (127.0.0.1 vs 127.0.0.2) are different origins.
+                normalized_origin = _normalize_host_for_comparison(origin_host)
+                normalized_host = _normalize_host_for_comparison(host)
+                if normalized_origin != normalized_host:
                     return False
             return True
 

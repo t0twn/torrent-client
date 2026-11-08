@@ -22,7 +22,7 @@ from management import (
     ManagementService,
     _address_family_for,
     _is_loopback_host,
-    _loopback_equivalent,
+    _normalize_host_for_comparison,
     _origin_is_loopback,
     _parse_host_port,
     _parse_origin,
@@ -316,6 +316,30 @@ class OriginParserTests(unittest.TestCase):
         self.assertIsNone(_parse_origin("ftp://127.0.0.1"))
         self.assertIsNone(_parse_origin("not-a-url"))
 
+    def test_parse_origin_rejects_path(self):
+        # An Origin with a path component is malformed.
+        self.assertIsNone(_parse_origin("http://127.0.0.1:8080/evil"))
+        self.assertIsNone(_parse_origin("http://127.0.0.1:8080/path/more"))
+
+    def test_parse_origin_rejects_userinfo(self):
+        self.assertIsNone(_parse_origin("http://user@127.0.0.1:8080"))
+        self.assertIsNone(_parse_origin("http://user:pass@127.0.0.1:8080"))
+
+    def test_parse_origin_rejects_bad_port(self):
+        # Non-numeric port must not raise; returns None.
+        self.assertIsNone(_parse_origin("http://127.0.0.1:bad"))
+        self.assertIsNone(_parse_origin("http://127.0.0.1:-1"))
+
+    def test_parse_origin_rejects_query_and_fragment(self):
+        self.assertIsNone(_parse_origin("http://127.0.0.1:8080?x=1"))
+        self.assertIsNone(_parse_origin("http://127.0.0.1:8080#frag"))
+
+    def test_parse_origin_handles_unclosed_bracket(self):
+        # Must not raise a traceback.
+        self.assertIsNone(_parse_origin("http://[::1"))
+        # Well-formed bracket is OK.
+        self.assertEqual(_parse_origin("http://[::1]:8080"), ("http", "::1", 8080))
+
 
 class HostParserTests(unittest.TestCase):
     def test_parse_host_port_ipv4(self):
@@ -334,20 +358,19 @@ class HostParserTests(unittest.TestCase):
         self.assertEqual(_parse_host_port("host:notaport"), ("", None, False))
 
 
-class LoopbackEquivalenceTests(unittest.TestCase):
-    def test_all_loopback_literals_are_equivalent(self):
-        self.assertTrue(_loopback_equivalent("127.0.0.1", "localhost"))
-        self.assertTrue(_loopback_equivalent("::1", "127.0.0.1"))
-        self.assertTrue(_loopback_equivalent("localhost", "[::1]"))
-        self.assertTrue(_loopback_equivalent("127.1.2.3", "::1"))
+class HostNormalizationTests(unittest.TestCase):
+    def test_same_host_normalizes_identically(self):
+        self.assertEqual(_normalize_host_for_comparison("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(_normalize_host_for_comparison("LOCALHOST"), "localhost")
+        self.assertEqual(_normalize_host_for_comparison("[::1]"), "::1")
+        self.assertEqual(_normalize_host_for_comparison("::1"), "::1")
 
-    def test_non_loopback_not_equivalent_to_loopback(self):
-        self.assertFalse(_loopback_equivalent("127.0.0.1", "10.0.0.1"))
-        self.assertFalse(_loopback_equivalent("evil.com", "localhost"))
-
-    def test_non_loopback_must_match_exactly(self):
-        self.assertFalse(_loopback_equivalent("10.0.0.1", "10.0.0.2"))
-        self.assertTrue(_loopback_equivalent("10.0.0.1", "10.0.0.1"))
+    def test_different_loopback_hosts_do_not_normalize_to_same(self):
+        # 127.0.0.1 and 127.0.0.2 are different origins even though both loopback
+        self.assertNotEqual(
+            _normalize_host_for_comparison("127.0.0.1"),
+            _normalize_host_for_comparison("127.0.0.2"),
+        )
 
 
 class ImmediateDispatcher:
@@ -534,17 +557,179 @@ class LoopbackPeerHTTPTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
-    def test_same_origin_with_different_loopback_name_is_allowed(self):
-        # Origin http://localhost:<port> should match target http://127.0.0.1:<port>
-        # because both are loopback-equivalent.
-        status, _ = self.request(
+    def test_different_loopback_host_name_is_rejected(self):
+        # Origin http://localhost:<port> does NOT match target Host 127.0.0.1:<port>
+        # — different loopback names are different origins.
+        status, payload = self.request(
             "GET", "/api/v1/status",
             extra_headers={
                 "Origin": f"http://localhost:{self.server.server_address[1]}",
                 "Host": f"127.0.0.1:{self.server.server_address[1]}",
             },
         )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["code"], "forbidden_origin")
+
+    def test_cross_host_loopback_post_is_rejected(self):
+        # A page on 127.0.0.2 must not mutate a server on 127.0.0.1.
+        # This tests the specific attack from the review.
+        status, payload = self.request(
+            "POST", "/api/v1/torrents",
+            body={"source": OTHER_HASH},
+            extra_headers={
+                "Origin": f"http://127.0.0.2:{self.server.server_address[1]}",
+                "Host": f"127.0.0.1:{self.server.server_address[1]}",
+                "Content-Type": "text/plain",
+            },
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["code"], "forbidden_origin")
+
+    def test_exact_origin_match_is_allowed(self):
+        # Origin and Host match exactly → allowed.
+        status, _ = self.request(
+            "GET", "/api/v1/status",
+            extra_headers={
+                "Origin": f"http://127.0.0.1:{self.server.server_address[1]}",
+                "Host": f"127.0.0.1:{self.server.server_address[1]}",
+            },
+        )
         self.assertEqual(status, 200)
+
+    def test_origin_with_path_is_rejected(self):
+        # Origin with a path component is malformed → 403.
+        status, payload = self.request(
+            "GET", "/api/v1/status",
+            extra_headers={
+                "Origin": f"http://127.0.0.1:{self.server.server_address[1]}/evil",
+                "Host": f"127.0.0.1:{self.server.server_address[1]}",
+            },
+        )
+        self.assertEqual(status, 403)
+
+    def test_origin_with_userinfo_is_rejected(self):
+        # Origin with userinfo is malformed → 403.
+        status, payload = self.request(
+            "GET", "/api/v1/status",
+            extra_headers={
+                "Origin": f"http://user@127.0.0.1:{self.server.server_address[1]}",
+                "Host": f"127.0.0.1:{self.server.server_address[1]}",
+            },
+        )
+        self.assertEqual(status, 403)
+
+    def test_origin_with_bad_port_is_rejected(self):
+        # Origin with non-numeric port is malformed → 403 (not a traceback).
+        # We use a raw socket to send the bad header since urllib would reject it.
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1])) as conn:
+            conn.settimeout(2)
+            conn.sendall(
+                b"GET /api/v1/status HTTP/1.1\r\n"
+                b"Host: 127.0.0.1:" + str(self.server.server_address[1]).encode() + b"\r\n"
+                b"Origin: http://127.0.0.1:bad\r\n"
+                b"\r\n"
+            )
+            # Read all response data including body.
+            response = b""
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if b'"forbidden_origin"' in response:
+                    break
+        # Must get a 403 response, not a connection drop.
+        self.assertIn(b"403", response)
+        self.assertIn(b"forbidden_origin", response)
+
+    def test_malformed_origin_ipv6_unclosed_bracket(self):
+        # Origin: http://[::1 (unclosed bracket) → 403, not a traceback.
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1])) as conn:
+            conn.settimeout(2)
+            conn.sendall(
+                b"GET /api/v1/status HTTP/1.1\r\n"
+                b"Host: 127.0.0.1:" + str(self.server.server_address[1]).encode() + b"\r\n"
+                b"Origin: http://[::1\r\n"
+                b"\r\n"
+            )
+            response = b""
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if b'"forbidden_origin"' in response:
+                    break
+        self.assertIn(b"403", response)
+        self.assertIn(b"forbidden_origin", response)
+
+
+class WildcardBindTests(unittest.TestCase):
+    """Test Origin handling on wildcard (0.0.0.0) binds.
+
+    A wildcard bind with allow-remote + token permits remote peers but still
+    accepts loopback peers without a token. A valid same-origin browser request
+    on a wildcard listener must work.
+    """
+
+    def setUp(self):
+        self.registry = FakeRegistry({HASH: FakeHandle()})
+        service = make_service(self.registry)
+        self.server = BoundedHTTPServer(
+            ("0.0.0.0", 0),
+            make_handler(ImmediateDispatcher(service), "secret"),
+            max_connections=4, header_timeout=1.0, body_timeout=1.0,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    def test_wildcard_bind_same_origin_request_works(self):
+        # A loopback peer on a wildcard listener with matching Origin/Host
+        # should be allowed (token-free because peer is loopback).
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/v1/status",
+            method="GET",
+            headers={
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "Host": f"127.0.0.1:{self.port}",
+            },
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = json.load(response)
+        self.assertEqual(payload["instance_id"], "node-1")
+
+    def test_wildcard_bind_cross_origin_still_rejected(self):
+        # Even on a wildcard bind, cross-origin requests are rejected.
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/v1/status",
+            method="GET",
+            headers={
+                "Content-Type": "application/json",
+                "Origin": f"http://127.0.0.2:{self.port}",
+                "Host": f"127.0.0.1:{self.port}",
+            },
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(raised.exception.code, 403)
+
+    def test_wildcard_bind_native_cli_without_origin_works(self):
+        # Native CLI (no Origin) on a loopback peer → allowed, no token needed.
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/v1/status",
+            method="GET",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = json.load(response)
+        self.assertEqual(payload["instance_id"], "node-1")
 
 
 class LoopbackPeerWithTokenHTTPTests(unittest.TestCase):
