@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 import os
@@ -19,8 +20,12 @@ from management import (
     LiveHandles,
     ManagementError,
     ManagementService,
+    _address_family_for,
     _is_loopback_host,
+    _loopback_equivalent,
     _origin_is_loopback,
+    _parse_host_port,
+    _parse_origin,
     make_handler,
     normalize_source,
     peer_is_loopback,
@@ -286,6 +291,7 @@ class HostAndOriginUnitTests(unittest.TestCase):
         self.assertFalse(_is_loopback_host(""))
 
     def test_origin_loopback(self):
+        # Backward-compat helper: only checks that the host is loopback.
         self.assertTrue(_origin_is_loopback("http://127.0.0.1:8080"))
         self.assertTrue(_origin_is_loopback("http://localhost"))
         self.assertTrue(_origin_is_loopback("http://[::1]:8080"))
@@ -296,6 +302,52 @@ class HostAndOriginUnitTests(unittest.TestCase):
         self.assertFalse(_origin_is_loopback("null"))
         self.assertFalse(_origin_is_loopback(""))
         self.assertFalse(_origin_is_loopback("ftp://127.0.0.1"))
+
+
+class OriginParserTests(unittest.TestCase):
+    def test_parse_origin_http(self):
+        self.assertEqual(_parse_origin("http://127.0.0.1:8080"), ("http", "127.0.0.1", 8080))
+        self.assertEqual(_parse_origin("http://localhost"), ("http", "localhost", 80))
+        self.assertEqual(_parse_origin("https://127.0.0.1"), ("https", "127.0.0.1", 443))
+
+    def test_parse_origin_rejects_bad_input(self):
+        self.assertIsNone(_parse_origin(""))
+        self.assertIsNone(_parse_origin("null"))
+        self.assertIsNone(_parse_origin("ftp://127.0.0.1"))
+        self.assertIsNone(_parse_origin("not-a-url"))
+
+
+class HostParserTests(unittest.TestCase):
+    def test_parse_host_port_ipv4(self):
+        self.assertEqual(_parse_host_port("127.0.0.1:8080"), ("127.0.0.1", 8080, True))
+        self.assertEqual(_parse_host_port("127.0.0.1"), ("127.0.0.1", None, True))
+        self.assertEqual(_parse_host_port("localhost:80"), ("localhost", 80, True))
+
+    def test_parse_host_port_ipv6(self):
+        self.assertEqual(_parse_host_port("[::1]:8080"), ("::1", 8080, True))
+        self.assertEqual(_parse_host_port("[::1]"), ("::1", None, True))
+        self.assertEqual(_parse_host_port("::1"), ("::1", None, True))
+
+    def test_parse_host_port_rejects_malformed(self):
+        self.assertEqual(_parse_host_port(""), ("", None, False))
+        self.assertEqual(_parse_host_port("[::1"), ("::1", None, False))
+        self.assertEqual(_parse_host_port("host:notaport"), ("", None, False))
+
+
+class LoopbackEquivalenceTests(unittest.TestCase):
+    def test_all_loopback_literals_are_equivalent(self):
+        self.assertTrue(_loopback_equivalent("127.0.0.1", "localhost"))
+        self.assertTrue(_loopback_equivalent("::1", "127.0.0.1"))
+        self.assertTrue(_loopback_equivalent("localhost", "[::1]"))
+        self.assertTrue(_loopback_equivalent("127.1.2.3", "::1"))
+
+    def test_non_loopback_not_equivalent_to_loopback(self):
+        self.assertFalse(_loopback_equivalent("127.0.0.1", "10.0.0.1"))
+        self.assertFalse(_loopback_equivalent("evil.com", "localhost"))
+
+    def test_non_loopback_must_match_exactly(self):
+        self.assertFalse(_loopback_equivalent("10.0.0.1", "10.0.0.2"))
+        self.assertTrue(_loopback_equivalent("10.0.0.1", "10.0.0.1"))
 
 
 class ImmediateDispatcher:
@@ -424,6 +476,76 @@ class LoopbackPeerHTTPTests(unittest.TestCase):
         # Loopback peer, safe Host → still allowed (X-Forwarded-For ignored).
         self.assertEqual(status, 200)
 
+    def test_cross_port_origin_is_rejected(self):
+        # A page served from a DIFFERENT loopback port must not mutate.
+        # Origin: http://127.0.0.1:<other_port> != target http://127.0.0.1:<port>
+        other_port = self.server.server_address[1] + 1
+        status, payload = self.request(
+            "POST", "/api/v1/torrents",
+            body={"source": OTHER_HASH},
+            extra_headers={
+                "Origin": f"http://127.0.0.1:{other_port}",
+                "Host": f"127.0.0.1:{self.server.server_address[1]}",
+                "Content-Type": "text/plain",
+            },
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["code"], "forbidden_origin")
+
+    def test_cross_scheme_origin_is_rejected(self):
+        # https://127.0.0.1:<port> is a different origin than http://127.0.0.1:<port>.
+        status, payload = self.request(
+            "POST", "/api/v1/torrents",
+            body={"source": OTHER_HASH},
+            extra_headers={
+                "Origin": f"https://127.0.0.1:{self.server.server_address[1]}",
+                "Host": f"127.0.0.1:{self.server.server_address[1]}",
+                "Content-Type": "text/plain",
+            },
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["code"], "forbidden_origin")
+
+    def test_null_origin_is_rejected(self):
+        status, payload = self.request(
+            "GET", "/api/v1/status",
+            extra_headers={
+                "Origin": "null",
+                "Host": f"127.0.0.1:{self.server.server_address[1]}",
+            },
+        )
+        self.assertEqual(status, 403)
+
+    def test_host_port_mismatch_is_rejected(self):
+        # Native-CLI-shaped request but Host port doesn't match the bound port.
+        status, payload = self.request(
+            "GET", "/api/v1/status",
+            extra_headers={"Host": f"127.0.0.1:{self.server.server_address[1] + 1}"},
+        )
+        self.assertEqual(status, 403)
+
+    def test_host_without_port_defaults_to_80(self):
+        # A Host header with no port implies port 80; only matches a server on port 80.
+        if self.server.server_address[1] == 80:
+            self.skipTest("server is on port 80")
+        status, payload = self.request(
+            "GET", "/api/v1/status",
+            extra_headers={"Host": "127.0.0.1"},
+        )
+        self.assertEqual(status, 403)
+
+    def test_same_origin_with_different_loopback_name_is_allowed(self):
+        # Origin http://localhost:<port> should match target http://127.0.0.1:<port>
+        # because both are loopback-equivalent.
+        status, _ = self.request(
+            "GET", "/api/v1/status",
+            extra_headers={
+                "Origin": f"http://localhost:{self.server.server_address[1]}",
+                "Host": f"127.0.0.1:{self.server.server_address[1]}",
+            },
+        )
+        self.assertEqual(status, 200)
+
 
 class LoopbackPeerWithTokenHTTPTests(unittest.TestCase):
     """A configured token is accepted on loopback but is not required."""
@@ -525,6 +647,229 @@ class NonLoopbackPeerHTTPTests(unittest.TestCase):
         self.assertEqual(status, 401)
 
 
+class SocketRegressionTests(unittest.TestCase):
+    """Restore socket-level regression tests for deadlines, slots, and HTTP contracts.
+
+    These run against a real BoundedHTTPServer with token-free loopback
+    authorization (no Authorization header, no token configured on server).
+    """
+
+    def setUp(self):
+        self.registry = FakeRegistry({HASH: FakeHandle()})
+        service = make_service(self.registry)
+        self.server = BoundedHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(ImmediateDispatcher(service), ""),
+            max_connections=1, header_timeout=0.3, body_timeout=0.3,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    def wait_for_slot(self):
+        self.assertTrue(self.server._slots.acquire(timeout=1))
+        self.server._slots.release()
+
+    def request(self, method, path, body=None, extra_headers=None):
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=data, method=method, headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_incomplete_header_expires_and_frees_connection_slot(self):
+        # A client that sends incomplete headers must be closed by the
+        # header deadline, and its slot must be released for the next client.
+        with socket.create_connection(("127.0.0.1", self.port)) as stalled:
+            stalled.settimeout(2)
+            stalled.sendall(b"GET /api/v1/status HTTP/1.1\r\nHost: localhost\r\n")
+            self.assertEqual(stalled.recv(1024), b"")
+        self.wait_for_slot()
+        status, _ = self.request("GET", "/api/v1/status")
+        self.assertEqual(status, 200)
+
+    def test_slow_header_drip_cannot_extend_absolute_deadline(self):
+        # Drip-feeding header bytes must not extend the absolute deadline.
+        with socket.create_connection(("127.0.0.1", self.port)) as stalled:
+            stalled.settimeout(2)
+            stalled.sendall(b"GET /api/v1/status HTTP/1.1\r\nH")
+            for chunk in (b"o", b"s", b"t", b":"):
+                time.sleep(0.06)
+                stalled.sendall(chunk)
+            self.assertEqual(stalled.recv(1024), b"")
+        self.wait_for_slot()
+
+    def test_incomplete_body_expires_and_frees_connection_slot(self):
+        # A client that advertises Content-Length: 100 but sends only a
+        # fragment must time out on the body deadline and release its slot.
+        with socket.create_connection(("127.0.0.1", self.port)) as stalled:
+            stalled.settimeout(2)
+            stalled.sendall(
+                b"POST /api/v1/torrents HTTP/1.1\r\n"
+                b"Host: 127.0.0.1:" + str(self.port).encode() + b"\r\n"
+                b"Content-Length: 100\r\n\r\n{"
+            )
+            self.assertEqual(stalled.recv(1024), b"")
+        self.wait_for_slot()
+        status, _ = self.request("GET", "/api/v1/status")
+        self.assertEqual(status, 200)
+
+    def test_connection_limit_rejects_second_client_while_first_is_stalled(self):
+        # With max_connections=1, a second client must be rejected (connection
+        # closed without response) while the first holds its slot.
+        with socket.create_connection(("127.0.0.1", self.port)) as stalled:
+            stalled.sendall(b"GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1:" + str(self.port).encode() + b"\r\n")
+            time.sleep(0.05)
+            with socket.create_connection(("127.0.0.1", self.port)) as second:
+                second.settimeout(1)
+                second.sendall(b"GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1:" + str(self.port).encode() + b"\r\n\r\n")
+                self.assertEqual(second.recv(1024), b"")
+
+    def test_http_not_found_contract(self):
+        status, payload = self.request("GET", "/api/v1/unknown")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["code"], "not_found")
+
+    def test_http_duplicate_and_capacity_contracts(self):
+        # Duplicate add → 409
+        status, payload = self.request("POST", "/api/v1/torrents", body={"source": HASH})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"]["code"], "duplicate")
+        # Capacity → 409
+        self.registry.maxsize = 1
+        status, payload = self.request("POST", "/api/v1/torrents", body={"source": OTHER_HASH})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"]["code"], "capacity_reached")
+
+    def test_http_validation_contract(self):
+        # Invalid source → 400
+        status, payload = self.request("POST", "/api/v1/torrents", body={"source": "/etc/passwd"})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_source")
+
+    def test_query_add_action_contracts(self):
+        status, payload = self.request("GET", "/api/v1/torrents")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["torrents"]), 1)
+
+        status, payload = self.request("POST", "/api/v1/torrents", body={"source": OTHER_HASH})
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["status"], "accepted")
+
+        status, payload = self.request("POST", f"/api/v1/torrents/{HASH}/pause", body={})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["affected"], 1)
+
+
+class IPv6ListenerTests(unittest.TestCase):
+    """IPv6 management binds where the platform supports IPv6.
+
+    These tests are skipped when IPv6 loopback is not available (some CI
+    environments disable it). The address-family selection is the part we
+    most need to verify — a real listener and real client confirm it works
+    end-to-end when available.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Probe for IPv6 loopback support
+        cls.ipv6_available = False
+        try:
+            probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            probe.bind(("::1", 0))
+            cls.ipv6_available = True
+            probe.close()
+        except OSError:
+            pass
+
+    def setUp(self):
+        if not self.ipv6_available:
+            self.skipTest("IPv6 loopback not available on this platform")
+        self.registry = FakeRegistry({HASH: FakeHandle()})
+        service = make_service(self.registry)
+        self.server = BoundedHTTPServer(
+            ("::1", 0),
+            make_handler(ImmediateDispatcher(service), ""),
+            max_connections=4, header_timeout=1.0, body_timeout=1.0,
+        )
+        self.addCleanup(self.server.server_close)
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        if self.ipv6_available:
+            self.server.shutdown()
+            self.thread.join()
+
+    def test_ipv6_listener_uses_af_inet6(self):
+        self.assertEqual(self.server.address_family, socket.AF_INET6)
+
+    def test_ipv6_loopback_peer_is_exempt(self):
+        # A real IPv6 loopback client can reach the server without a token.
+        request = urllib.request.Request(
+            f"http://[::1]:{self.port}/api/v1/status",
+            method="GET",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = json.load(response)
+        self.assertEqual(payload["instance_id"], "node-1")
+
+    def test_ipv6_listener_accepts_loopback_origin_match(self):
+        request = urllib.request.Request(
+            f"http://[::1]:{self.port}/api/v1/status",
+            method="GET",
+            headers={
+                "Content-Type": "application/json",
+                "Origin": f"http://[::1]:{self.port}",
+                "Host": f"[::1]:{self.port}",
+            },
+        )
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+
+    def test_ipv6_listener_rejects_cross_port_origin(self):
+        request = urllib.request.Request(
+            f"http://[::1]:{self.port}/api/v1/status",
+            method="GET",
+            headers={
+                "Content-Type": "application/json",
+                "Origin": f"http://[::1]:{self.port + 1}",
+                "Host": f"[::1]:{self.port}",
+            },
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(raised.exception.code, 403)
+
+
+class AddressFamilyUnitTests(unittest.TestCase):
+    def test_ipv4_literal_gives_af_inet(self):
+        self.assertEqual(_address_family_for("127.0.0.1"), socket.AF_INET)
+        self.assertEqual(_address_family_for("0.0.0.0"), socket.AF_INET)
+
+    def test_ipv6_literal_gives_af_inet6(self):
+        self.assertEqual(_address_family_for("::1"), socket.AF_INET6)
+        self.assertEqual(_address_family_for("::"), socket.AF_INET6)
+
+    def test_ipv6_with_zone_is_still_af_inet6(self):
+        self.assertEqual(_address_family_for("::1%lo0"), socket.AF_INET6)
+
+
 class PortCollisionTests(unittest.TestCase):
     def test_port_conflict_surfaces_as_oserror_with_hint(self):
         registry = FakeRegistry({HASH: FakeHandle()})
@@ -570,6 +915,8 @@ class APIClientTests(unittest.TestCase):
 
 class CLITests(unittest.TestCase):
     def test_json_success(self):
+        # The JSON output shape is stable regardless of transport; mocking the
+        # APIClient.request keeps this test focused on CLI formatting.
         payload = {"instance_id": "node-1", "mode": "download", "live_torrent_count": 0, "capacity": 2}
         output = io.StringIO()
         with patch.object(APIClient, "request", return_value=payload), contextlib.redirect_stdout(output):
@@ -585,45 +932,181 @@ class CLITests(unittest.TestCase):
         self.assertIn("not_found: missing", error.getvalue())
 
     def test_default_address_points_at_loopback(self):
-        # CLI with no --address and no env should target http://127.0.0.1:8080.
-        # Resolution is lazy in main(), so the raw argparse default is None;
-        # the fallback applied there is what users and tests observe.
-        parser = torrentctl.build_parser()
-        with patch.dict("os.environ", {}, clear=True):
-            args = parser.parse_args(["status"])
-        resolved = args.address or os.getenv("TORRENT_CLIENT_ADDRESS", torrentctl._DEFAULT_ADDRESS)
-        self.assertEqual(resolved, "http://127.0.0.1:8080")
-        resolved_token = args.token or os.getenv("TORRENT_CLIENT_TOKEN", "")
-        self.assertEqual(resolved_token, "")
+        # Resolution is lazy in main(); the literal default is what users observe.
+        self.assertEqual(torrentctl._DEFAULT_ADDRESS, "http://127.0.0.1:8080")
 
-    def test_env_overrides_default_address(self):
-        parser = torrentctl.build_parser()
-        with patch.dict("os.environ", {"TORRENT_CLIENT_ADDRESS": "http://seedbox:8081"}):
-            args = parser.parse_args(["status"])
-            resolved = args.address or os.getenv("TORRENT_CLIENT_ADDRESS", torrentctl._DEFAULT_ADDRESS)
-        self.assertEqual(resolved, "http://seedbox:8081")
-
-    def test_flag_overrides_env_and_default(self):
-        parser = torrentctl.build_parser()
-        with patch.dict("os.environ", {"TORRENT_CLIENT_ADDRESS": "http://env:8081"}):
-            args = parser.parse_args(["--address", "http://flag:9000", "status"])
-            resolved = args.address or os.getenv("TORRENT_CLIENT_ADDRESS", torrentctl._DEFAULT_ADDRESS)
-        self.assertEqual(resolved, "http://flag:9000")
-
-    def test_cli_works_without_any_address_or_token(self):
-        # End-to-end: CLI default address hits the live loopback-bound server
-        # (no token configured) and returns success.
-        server, thread, _ = _make_server(token="")
+    def test_address_precedence_through_main(self):
+        # flag > env > default — exercised through main() against a live server.
+        registry = FakeRegistry({HASH: FakeHandle()})
+        service = make_service(registry)
+        server = BoundedHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(ImmediateDispatcher(service), ""),
+            max_connections=4, header_timeout=1.0, body_timeout=1.0,
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
         try:
-            payload = {"instance_id": "node-1", "mode": "download", "live_torrent_count": 0, "capacity": 2}
+            address = f"http://127.0.0.1:{server.server_address[1]}"
+
+            # Flag beats env: pass env with a bogus value, flag with the real one.
             output = io.StringIO()
             with (
-                patch.object(APIClient, "request", return_value=payload),
-                patch.dict("os.environ", {}, clear=True),
+                patch.dict("os.environ", {"TORRENT_CLIENT_ADDRESS": "http://env.invalid:9"}),
+                contextlib.redirect_stdout(output),
+            ):
+                code = torrentctl.main(["--address", address, "status"])
+            self.assertEqual(code, 0)
+            self.assertIn("node-1", output.getvalue())
+
+            # Env beats default: set env to the real address, no flag.
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", {"TORRENT_CLIENT_ADDRESS": address}),
                 contextlib.redirect_stdout(output),
             ):
                 code = torrentctl.main(["status"])
             self.assertEqual(code, 0)
+            self.assertIn("node-1", output.getvalue())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_cli_live_status_list_add_action(self):
+        # End-to-end CLI commands against a live loopback server (unmocked).
+        registry = FakeRegistry({HASH: FakeHandle()})
+        service = make_service(registry)
+        server = BoundedHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(ImmediateDispatcher(service), ""),
+            max_connections=4, header_timeout=1.0, body_timeout=1.0,
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            address = f"http://127.0.0.1:{server.server_address[1]}"
+
+            # status
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = torrentctl.main(["--address", address, "--json", "status"])
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["instance_id"], "node-1")
+
+            # list
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = torrentctl.main(["--address", address, "--json", "list"])
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(len(payload["torrents"]), 1)
+
+            # add
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = torrentctl.main(["--address", address, "--json", "add", OTHER_HASH])
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["status"], "accepted")
+            self.assertEqual(payload["info_hash"], OTHER_HASH)
+
+            # action (pause)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = torrentctl.main(["--address", address, "--json", "pause", HASH])
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["action"], "pause")
+            self.assertEqual(payload["affected"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_default_address_live_when_port_8080_available(self):
+        # If port 8080 is free, bind there and exercise the CLI with no
+        # --address and no env — it must connect to the default literal.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", 8080))
+        except OSError:
+            probe.close()
+            self.skipTest("port 8080 is occupied; cannot exercise literal default")
+        probe.close()
+
+        registry = FakeRegistry({HASH: FakeHandle()})
+        service = make_service(registry)
+        server = BoundedHTTPServer(
+            ("127.0.0.1", 8080),
+            make_handler(ImmediateDispatcher(service), ""),
+            max_connections=4, header_timeout=1.0, body_timeout=1.0,
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            output = io.StringIO()
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                contextlib.redirect_stdout(output),
+            ):
+                code = torrentctl.main(["--json", "status"])
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["instance_id"], "node-1")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_remote_missing_token_returns_unauthorized(self):
+        # When the server requires a token (simulated by patching peer_is_loopback
+        # to return False), the CLI without a token must report an API error.
+        registry = FakeRegistry({HASH: FakeHandle()})
+        service = make_service(registry)
+        server = BoundedHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(ImmediateDispatcher(service), "secret"),
+            max_connections=4, header_timeout=1.0, body_timeout=1.0,
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            address = f"http://127.0.0.1:{server.server_address[1]}"
+            error = io.StringIO()
+            with (
+                patch("management.peer_is_loopback", return_value=False),
+                contextlib.redirect_stderr(error),
+            ):
+                code = torrentctl.main(["--address", address, "status"])
+            self.assertEqual(code, 3)
+            self.assertIn("unauthorized", error.getvalue())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_remote_wrong_token_returns_unauthorized(self):
+        registry = FakeRegistry({HASH: FakeHandle()})
+        service = make_service(registry)
+        server = BoundedHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(ImmediateDispatcher(service), "secret"),
+            max_connections=4, header_timeout=1.0, body_timeout=1.0,
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            address = f"http://127.0.0.1:{server.server_address[1]}"
+            error = io.StringIO()
+            with (
+                patch("management.peer_is_loopback", return_value=False),
+                contextlib.redirect_stderr(error),
+            ):
+                code = torrentctl.main(["--address", address, "--token", "wrong", "status"])
+            self.assertEqual(code, 3)
+            self.assertIn("unauthorized", error.getvalue())
         finally:
             server.shutdown()
             server.server_close()
