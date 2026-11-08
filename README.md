@@ -52,7 +52,7 @@ Supported environment settings are:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `MANAGEMENT_HOST` | `127.0.0.1` | HTTP bind address; loopback recommended |
+| `MANAGEMENT_HOST` | `127.0.0.1` | HTTP bind address; loopback recommended. IPv6 literals (e.g. `::1`) are supported when the platform has an IPv6 stack. |
 | `MANAGEMENT_PORT` | `8080` | HTTP port; `0` disables management |
 | `MANAGEMENT_TOKEN` | empty | Bearer secret, optional on loopback, required for non-loopback |
 | `MANAGEMENT_INSTANCE_ID` | hostname | Stable operator-selected instance identity |
@@ -176,7 +176,7 @@ CLI exit codes are stable: `0` success, `2` command-line/configuration error, `3
 
 Authorization is decided from the actual TCP peer address — the `client_address` of the accepted socket — not from request headers. Loopback peers (IPv4 `127.0.0.0/8`, IPv6 `::1`, and IPv4-mapped IPv6 loopback such as `::ffff:127.0.0.1`) are exempt from bearer authentication regardless of whether `MANAGEMENT_TOKEN` is configured. Non-loopback peers always need the correct bearer token; a missing or incorrect token is rejected with HTTP `401`.
 
-Loopback listeners also enforce a same-origin / Host safeguard against cross-site browser requests and DNS-rebinding attacks: requests whose `Origin` header (when present) or `Host` header identifies a non-loopback endpoint are rejected with HTTP `403`. Native CLI requests (which do not send `Origin`) continue to work unchanged. Forwarding headers such as `X-Forwarded-For`, `Forwarded`, or `X-Real-IP` are deliberately not consulted — when a reverse proxy or tunnel delivers external requests as loopback connections, the proxy is responsible for policing its own access. This safeguard identifies the TCP peer; it does not identify the original client behind a proxy, and claims otherwise should be treated skeptically.
+Loopback listeners also enforce a same-origin / Host safeguard against cross-site browser requests and DNS-rebinding attacks: when a request carries an `Origin` header, the origin must exactly match the target — same scheme (always `http` for this plain-HTTP server), a loopback-equivalent host (`127.0.0.1`, `localhost`, `::1` are equivalent), and identical port. A page served from a different loopback port or scheme cannot mutate torrents. The `Host` header must also identify a loopback endpoint with a port that matches the bound port; mismatched or malformed Host values are rejected with HTTP `403`. Native CLI requests (which do not send `Origin`) continue to work unchanged as long as their `Host` header carries the correct bound port. Forwarding headers such as `X-Forwarded-For`, `Forwarded`, or `X-Real-IP` are deliberately not consulted — when a reverse proxy or tunnel delivers external requests as loopback connections, the proxy is responsible for policing its own access. This safeguard identifies the TCP peer; it does not identify the original client behind a proxy, and claims otherwise should be treated skeptically.
 
 `docker-compose.yml` uses host networking by default, which means the loopback management listener is reachable from the host and from other containers that also use the host network namespace. It is not reachable from bridged containers. Do not re-publish the management port to the internet.
 

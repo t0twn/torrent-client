@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import hmac
 import ipaddress
 import json
@@ -356,7 +357,11 @@ class CommandDispatcher:
 
 
 class BoundedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    """Reject surplus clients before a worker thread is allocated."""
+    """Reject surplus clients before a worker thread is allocated.
+
+    Automatically selects AF_INET or AF_INET6 based on the bind address so
+    both IPv4 (e.g. 127.0.0.1) and IPv6 (e.g. ::1) binds work.
+    """
 
     allow_reuse_address = True
     daemon_threads = True
@@ -369,6 +374,7 @@ class BoundedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self._slots = threading.BoundedSemaphore(max_connections)
         self.header_timeout = header_timeout
         self.body_timeout = body_timeout
+        self.address_family = _address_family_for(address[0])
         super().__init__(address, handler)
 
     def process_request(self, request: socket.socket, client_address: Any) -> None:
@@ -388,33 +394,119 @@ class BoundedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             self._slots.release()
 
 
-# Safe loopback origins for browser Origin-header checks. Used only to defend
-# loopback listeners against cross-site browser requests and DNS rebinding.
-_SAFE_LOOPBACK_ORIGINS: frozens[tuple[str, int]] = frozenset({
-    ("127.0.0.1", None),
-    ("127.0.0.1", 8080),
-    ("localhost", None),
-    ("localhost", 8080),
-    ("::1", None),
-    ("::1", 8080),
-    ("[::1]", None),
-    ("[::1]", 8080),
-})
+def _address_family_for(host: str) -> int:
+    """Return AF_INET6 when `host` resolves to an IPv6 address, else AF_INET."""
+    bare = host.split("%")[0] if "%" in host else host
+    try:
+        addr = ipaddress.ip_address(bare)
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(bare, None, type=socket.SOCK_STREAM)
+        except socket.gaierror:
+            return socket.AF_INET
+        if infos and infos[0][0] == socket.AF_INET6:
+            return socket.AF_INET6
+        return socket.AF_INET
+    if isinstance(addr, ipaddress.IPv6Address):
+        return socket.AF_INET6
+    return socket.AF_INET
 
 
-def _origin_is_loopback(origin: str) -> bool:
-    """True when the Origin header value identifies a loopback endpoint."""
-    if not origin:
+def _is_loopback_literal(host: str) -> bool:
+    """True if `host` is a loopback IP literal (127/8, ::1) or 'localhost'."""
+    host = host.strip().lower()
+    if not host:
         return False
+    if host == "localhost":
+        return True
+    # Strip IPv6 brackets if present
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _loopback_equivalent(a: str, b: str) -> bool:
+    """True if both hosts are loopback (any loopback name is equivalent to any other)."""
+    a_loopback = _is_loopback_literal(a)
+    b_loopback = _is_loopback_literal(b)
+    if a_loopback and b_loopback:
+        return True
+    if a_loopback != b_loopback:
+        return False
+    return a.lower().strip("[]") == b.lower().strip("[]")
+
+
+def _parse_origin(origin: str) -> tuple[str, str, int] | None:
+    """Parse an Origin header into (scheme, host, port).
+
+    Returns None when the Origin is malformed or has an unsupported scheme.
+    """
+    if not origin:
+        return None
     parsed = urllib.parse.urlsplit(origin)
     scheme = (parsed.scheme or "").lower()
     if scheme not in ("http", "https"):
-        return False
-    host = parsed.hostname or ""
+        return None
+    host = (parsed.hostname or "").lower()
     if not host:
+        return None
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, host, port
+
+
+def _parse_host_port(host_value: str) -> tuple[str, int | None, bool]:
+    """Parse a Host header into (host, port, well_formed).
+
+    `well_formed` is False when the value cannot be parsed cleanly.
+    Port is None when no port is present.
+    """
+    value = (host_value or "").strip()
+    if not value:
+        return "", None, False
+    if value.startswith("["):
+        close = value.find("]")
+        if close < 0:
+            return value.lstrip("["), None, False
+        host = value[1:close]
+        rest = value[close + 1:]
+        if not rest:
+            return host, None, True
+        if rest == ":":
+            return host, None, False
+        if rest.startswith(":"):
+            try:
+                return host, int(rest[1:]), True
+            except ValueError:
+                return host, None, False
+        return host, None, False
+    if value.count(":") == 1:
+        host_part, port_part = value.rsplit(":", 1)
+        try:
+            return host_part, int(port_part), True
+        except ValueError:
+            return "", None, False
+    if ":" in value:
+        # Multiple colons with no brackets → bare IPv6, no port
+        return value, None, True
+    return value, None, True
+
+
+def _origin_is_loopback(origin: str) -> bool:
+    """True when the Origin header value identifies a loopback endpoint.
+
+    Kept for backward compatibility with unit-level checks. The HTTP handler
+    uses `_origin_matches_target` for strict validation instead.
+    """
+    parsed = _parse_origin(origin)
+    if parsed is None:
         return False
-    # The port is irrelevant to loopback-ness; only the host matters.
-    return _is_loopback_host(host)
+    _, host, _ = parsed
+    return _is_loopback_literal(host)
 
 
 def make_handler(dispatcher: CommandDispatcher, token: str) -> type[BaseHTTPRequestHandler]:
@@ -476,22 +568,56 @@ def make_handler(dispatcher: CommandDispatcher, token: str) -> type[BaseHTTPRequ
         def _origin_host_is_safe(self) -> bool:
             """For loopback-bound listeners: reject cross-site browser requests.
 
-            Browsers send Origin on cross-site requests and on POST; native CLIs
-            do not. Origin (when present) must identify a loopback endpoint, and
-            the Host header must also resolve to a loopback address. This blocks
-            DNS-rebinding attacks where an attacker's domain points to 127.0.0.1.
+            When the request carries an Origin header (browsers on cross-site
+            requests and on POST), the Origin must exactly match the target
+            origin — same scheme (always http for this plain-HTTP server),
+            loopback-equivalent host, and identical port. This blocks a page
+            served from a different loopback port or scheme from mutating
+            torrents via a simple text/plain POST that would otherwise bypass
+            CORS preflight.
 
-            Forwarding headers (X-Forwarded-For, Forwarded, X-Real-IP, ...) are
-            intentionally ignored — a reverse proxy that delivers external
+            When no Origin is present (native CLI shape), the Host header
+            must still identify a loopback endpoint with a well-formed port
+            that matches the bound port. This defends against DNS rebinding
+            and Host-forging attacks.
+
+            Forwarding headers (X-Forwarded-For, Forwarded, X-Real-IP, ...)
+            are intentionally ignored — a reverse proxy that delivers external
             requests as loopback is the proxy's responsibility to police.
             """
-            origin = self.headers.get("Origin")
-            if origin:
-                if not _origin_is_loopback(origin):
-                    return False
-            host = self.headers.get("Host", "")
+            # Parse the Host header first — required and must be well-formed.
+            raw_host = self.headers.get("Host", "")
+            host, port, well_formed = _parse_host_port(raw_host)
+            if not well_formed or not host:
+                return False
             if not _is_loopback_host(host):
                 return False
+            # If the Host carries a port, it must match the bound port.
+            server_port = self.server.server_address[1]
+            if port is not None and port != server_port:
+                return False
+            # If no port in Host, the default is 80; reject if server isn't on 80.
+            if port is None and server_port != 80:
+                return False
+
+            # If an Origin header is present, it must match the target exactly.
+            origin = self.headers.get("Origin")
+            if origin is not None:
+                parsed = _parse_origin(origin)
+                if parsed is None:
+                    # Malformed Origin (null, bad scheme, missing host, etc.)
+                    return False
+                scheme, origin_host, origin_port = parsed
+                # Scheme must be http (this is a plain-HTTP server)
+                if scheme != "http":
+                    return False
+                # Port must match exactly
+                if origin_port != server_port:
+                    return False
+                # Host must be loopback-equivalent to the bound address
+                server_host = self.server.server_address[0]
+                if not _loopback_equivalent(origin_host, server_host):
+                    return False
             return True
 
         def _authorized(self) -> tuple[bool, str]:
@@ -595,9 +721,17 @@ def start_management_server(
     try:
         server = BoundedHTTPServer((host, port), make_handler(dispatcher, token))
     except OSError as exc:
+        # Preserve the underlying cause. Only mention port conflict when the
+        # kernel actually reported EADDRINUSE; other failures (unsupported
+        # address family, missing IPv6 stack, permission denied, …) surface
+        # with their real message.
+        if exc.errno == errno.EADDRINUSE:
+            raise OSError(
+                f"failed to bind management HTTP on {host}:{port}; "
+                "choose a different management port or stop the conflicting listener"
+            ) from exc
         raise OSError(
-            f"failed to bind management HTTP on {host}:{port}; "
-            "choose a different management port or stop the conflicting listener"
+            f"failed to bind management HTTP on {host}:{port}: {exc.strerror or exc}"
         ) from exc
     thread = threading.Thread(target=server.serve_forever, name="management-http", daemon=True)
     thread.start()
