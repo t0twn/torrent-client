@@ -2213,7 +2213,7 @@ class LatestVerificationRegressionTests(unittest.TestCase):
             patch.object(app_module, "TRACKERS", [], create=True),
             patch.object(app_module, "METADATA_QUEUE", queue_module.Queue(maxsize=20)),
             patch.object(app_module, "lt", FakeLT),
-            patch.object(app_module, "MANAGEMENT_ORIGIN_ADDS", {HASH_A}),
+            patch.object(app_module, "MANAGEMENT_ORIGIN_ADDS", {HASH_A: 1}),
         ]
         for p in patches:
             p.start()
@@ -2270,6 +2270,7 @@ class LatestVerificationRegressionTests(unittest.TestCase):
             patch.object(app_module, "TORRENTS", torrents, create=True),
             patch.object(app_module, "LIVE_HANDLES", live_handles),
             patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+            patch.object(app_module, "LATE_HANDLE_REMOVAL_RETRIES", []),
         ]
         for p in patches:
             p.start()
@@ -2296,9 +2297,11 @@ class LatestVerificationRegressionTests(unittest.TestCase):
         self.assertIsNone(live_handles.get(HASH_A))
 
     # Blocker 3: failed retry is bounded.
-    def test_failed_late_handle_removal_bounded(self):
-        """After MAX_LATE_HANDLE_RETRY_ATTEMPTS, the retry entry is
-        dropped to prevent unbounded memory growth."""
+    def test_failed_late_handle_removal_infinite_retry(self):
+        """After many failed attempts, the retry entry is NOT dropped.
+        We keep ownership of the handle indefinitely until removal
+        succeeds, so we don't violate the physical concurrency bound by
+        abandoning a still-live handle."""
 
         import app as app_module
 
@@ -2319,6 +2322,7 @@ class LatestVerificationRegressionTests(unittest.TestCase):
             patch.object(app_module, "TORRENTS", torrents, create=True),
             patch.object(app_module, "LIVE_HANDLES", live_handles),
             patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+            patch.object(app_module, "LATE_HANDLE_REMOVAL_RETRIES", []),
         ]
         for p in patches:
             p.start()
@@ -2331,12 +2335,146 @@ class LatestVerificationRegressionTests(unittest.TestCase):
         app_module._safe_remove_late_handle(handle, HASH_A)
         self.assertEqual(len(app_module.LATE_HANDLE_REMOVAL_RETRIES), 1)
 
-        # Drive enough iterations to exceed max attempts.
-        for _ in range(app_module.MAX_LATE_HANDLE_RETRY_ATTEMPTS + 2):
+        # Drive many iterations; entry is NOT dropped.
+        for _ in range(10):
             app_module._drive_sniff_scheduler(clock())
 
-        # Entry was dropped after exceeding max attempts.
-        self.assertEqual(len(app_module.LATE_HANDLE_REMOVAL_RETRIES), 0)
+        # Entry is still there, still owned, attempts incremented.
+        self.assertEqual(len(app_module.LATE_HANDLE_REMOVAL_RETRIES), 1)
+        self.assertEqual(app_module.LATE_HANDLE_REMOVAL_RETRIES[0][0], handle)
+        self.assertEqual(app_module.LATE_HANDLE_REMOVAL_RETRIES[0][1], HASH_A)
+        self.assertEqual(app_module.LATE_HANDLE_REMOVAL_RETRIES[0][2], 10)
+        # Handle still in LIVE_HANDLES/TORRENTS (ownership retained).
+        self.assertIs(live_handles.get(HASH_A), handle)
+        self.assertIn(HASH_A, torrents)
+
+    # Blocker 2: hash-only management provenance interleaving.
+    def test_old_scheduler_alert_before_management_alert_limitation(self):
+        """DOCUMENTED LIMITATION: When an old scheduler alert arrives
+        BEFORE the management alert for the same hash, the system
+        cannot distinguish them without libtorrent request identity.
+
+        The current best-effort behavior:
+        1. Scheduler has HASH_A in COOLDOWN (previous failed attempt)
+        2. Management API calls add_torrent(HASH_A) - counter becomes 1
+        3. Old scheduler add_torrent_alert arrives first
+           - counter > 0 AND scheduler not active → treated as management
+           - counter decremented to 0
+           - old handle is KEPT (not removed)
+        4. Management add_torrent_alert arrives
+           - counter is 0, treated as scheduler alert
+           - scheduler rejects (in COOLDOWN)
+           - management handle is REMOVED
+
+        This is a known limitation. Without libtorrent request identity,
+        we cannot perfectly distinguish alerts. The test verifies the
+        actual best-effort behavior and documents the limitation.
+
+        To fully solve this, libtorrent would need to expose per-request
+        identifiers or a cancel API (not available in 2.0.11).
+        """
+
+        import app as app_module
+        import queue as queue_module
+
+        scheduler, clock = make_scheduler()
+        removed = []
+        session = SimpleNamespace(
+            async_add_torrent=lambda p: None,
+            remove_torrent=lambda h: removed.append(h),
+        )
+        torrents = app_module.TTLDict(maxsize=100, ttl=600)
+        live_handles = app_module.LiveHandles(maxsize=100)
+
+        # Put scheduler in COOLDOWN for HASH_A.
+        scheduler.on_announce(HASH_A, now=clock())
+        scheduler.on_async_add_failed(HASH_A, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+
+        class FakeLT:
+            dht_pkt_alert = type("dht_pkt_alert", (), {})
+            metadata_received_alert = type("metadata_received_alert", (), {})
+
+            class add_torrent_alert:
+                pass
+
+        class FakeHandle:
+            def __init__(self, info_hash):
+                self.info_hash = info_hash
+                self._valid = True
+                self._status = SimpleNamespace(
+                    info_hashes=SimpleNamespace(
+                        has_v1=lambda: True, has_v2=lambda: False, v1=info_hash,
+                    ),
+                )
+
+            def is_valid(self):
+                return self._valid
+
+            def status(self):
+                return self._status
+
+            def set_max_connections(self, n):
+                pass
+
+            def set_max_uploads(self, n):
+                pass
+
+        patches = [
+            patch.object(app_module, "OPTIONS", SimpleNamespace(download_mode=False, save_path="/tmp"), create=True),
+            patch.object(app_module, "SESSION", session, create=True),
+            patch.object(app_module, "TORRENTS", torrents, create=True),
+            patch.object(app_module, "LIVE_HANDLES", live_handles),
+            patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+            patch.object(app_module, "TORRENT_DIR", "/tmp"),
+            patch.object(app_module, "TRACKERS", [], create=True),
+            patch.object(app_module, "METADATA_QUEUE", queue_module.Queue(maxsize=20)),
+            patch.object(app_module, "lt", FakeLT),
+            patch.object(app_module, "MANAGEMENT_ORIGIN_ADDS", {}),
+            patch.object(app_module, "LATE_HANDLE_REMOVAL_RETRIES", []),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        # Reserve HASH_A in TORRENTS (management API registration).
+        torrents.put(HASH_A, None)
+
+        # Management API calls add_torrent - counter becomes 1.
+        app_module.MANAGEMENT_ORIGIN_ADDS[HASH_A] = 1
+
+        # Old scheduler alert arrives first.
+        old_handle = FakeHandle(HASH_A)
+        old_alert = FakeLT.add_torrent_alert()
+        old_alert.handle = old_handle
+        old_alert.params = SimpleNamespace(
+            info_hashes=SimpleNamespace(
+                has_v1=lambda: True, has_v2=lambda: False, v1=HASH_A,
+            )
+        )
+        app_module.handle_alert_add_torrent(old_alert)
+
+        # BEST-EFFORT BEHAVIOR (documented limitation):
+        # - Counter consumed (old alert treated as management)
+        # - Old handle KEPT (not removed)
+        self.assertEqual(app_module.MANAGEMENT_ORIGIN_ADDS.get(HASH_A, 0), 0)
+        self.assertNotIn(old_handle, removed)
+
+        # Management alert arrives second.
+        mgmt_handle = FakeHandle(HASH_A)
+        mgmt_alert = FakeLT.add_torrent_alert()
+        mgmt_alert.handle = mgmt_handle
+        mgmt_alert.params = SimpleNamespace(
+            info_hashes=SimpleNamespace(
+                has_v1=lambda: True, has_v2=lambda: False, v1=HASH_A,
+            )
+        )
+        app_module.handle_alert_add_torrent(mgmt_alert)
+
+        # Counter is 0, so treated as scheduler alert.
+        # Scheduler rejects (in COOLDOWN).
+        # Management handle REMOVED.
+        self.assertIn(mgmt_handle, removed)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ import libtorrent as lt
 from management import CommandDispatcher, LiveHandles, ManagementService, start_management_server
 from sniff_scheduler import (
     Admission,
+    CandidateState,
     Diagnostics,
     SniffScheduler,
     SniffSchedulerConfig,
@@ -67,28 +68,33 @@ MANAGEMENT_SERVER = None
 LIVE_HANDLES = None
 SNIFF_SCHEDULER = None
 
-# Module-level set tracking info-hashes that were submitted via management
-# API (not via the scheduler). When add_torrent is called from management,
-# we register the hash here. When the corresponding add_torrent_alert
-# arrives, handle_alert_add_torrent checks this set and passes the alert
-# through without scheduler validation.
+# Module-level counter tracking pending management-origin add_torrent calls
+# per info_hash. When management API calls add_torrent, we increment the
+# counter for that hash. When the corresponding add_torrent_alert arrives,
+# we decrement. If the counter is > 0 at alert time, the alert is for a
+# management add (not a stale scheduler alert).
 #
-# This is necessary because the scheduler cannot distinguish a management
-# add from a stale scheduler alert when the candidate is in COOLDOWN
-# state. By tracking management-origin adds explicitly, we ensure that
-# management API adds during scheduler cooldown are not wrongly removed.
+# This correctly handles:
+# - Multiple management adds for the same hash (counter tracks all of them)
+# - Old scheduler alerts arriving before the management alert (counter not
+#   yet incremented, so treated as scheduler alert)
+# - Management alert arriving after old scheduler alert (counter was
+#   incremented by the management call, so treated as management add)
+# - Failure cleanup: if add_torrent raises, we decrement the counter in
+#   a finally block so the marker doesn't leak
 #
-# This set is only meaningful in sniff mode; in download mode, there's
-# no scheduler to conflict with.
-MANAGEMENT_ORIGIN_ADDS: set = set()
+# Bounded by the number of distinct hashes management API has added,
+# which is naturally bounded by management API rate and MAX_TORRENTS.
+MANAGEMENT_ORIGIN_ADDS: dict = {}  # info_hash -> pending count
 
 # Bounded collection of (handle, info_hash, attempts) tuples for handles
 # whose removal failed. _drive_sniff_scheduler retries these on each
-# alert-loop iteration up to MAX_LATE_HANDLE_RETRY_ATTEMPTS times.
-# This prevents a failed SESSION.remove_torrent from silently leaking
-# capacity.
+# alert-loop iteration indefinitely until removal succeeds. We do NOT
+# drop entries after a fixed attempt count because doing so would abandon
+# ownership of a still-live handle, violating the physical concurrency
+# bound. The list is naturally bounded by the number of late alerts
+# processed (each adds at most one entry).
 LATE_HANDLE_REMOVAL_RETRIES: list = []
-MAX_LATE_HANDLE_RETRY_ATTEMPTS = 3
 
 
 def env_int(name, default):
@@ -1265,16 +1271,39 @@ def handle_alert_add_torrent(a):
         except AttributeError:
             info_hash = None
         if info_hash is not None:
-            # Check if this is a management-origin add (registered by the
-            # management callback wrapper). If so, bypass scheduler
-            # validation and let the handle stay.
-            is_management_add = info_hash in MANAGEMENT_ORIGIN_ADDS
-            if is_management_add:
-                MANAGEMENT_ORIGIN_ADDS.discard(info_hash)
+            # Determine whether this is a management-origin add. We use
+            # two signals:
+            # 1. The scheduler's state: if no candidate or candidate is
+            #    in COOLDOWN/QUEUED (not actively tracking), the alert
+            #    is definitely management-origin.
+            # 2. The MANAGEMENT_ORIGIN_ADDS counter: if > 0, there's a
+            #    pending management add for this hash.
+            #
+            # We only consume the counter when the scheduler's state
+            # confirms the alert is for a non-active attempt. This
+            # prevents a stale scheduler alert from consuming the
+            # management marker when a real management alert is still
+            # pending.
+            scheduler_state = scheduler.state_of(info_hash)
+            scheduler_active = scheduler_state in (
+                CandidateState.IN_FLIGHT,
+                CandidateState.PENDING_REMOVAL,
+                CandidateState.PERSISTING,
+            ) if scheduler_state is not None else False
+            pending_count = MANAGEMENT_ORIGIN_ADDS.get(info_hash, 0)
+
+            if not scheduler_active and pending_count > 0:
+                # Scheduler is not actively tracking this hash AND we
+                # have a pending management add. Treat as management.
+                MANAGEMENT_ORIGIN_ADDS[info_hash] -= 1
+                if MANAGEMENT_ORIGIN_ADDS[info_hash] <= 0:
+                    del MANAGEMENT_ORIGIN_ADDS[info_hash]
                 # Management add: pass through without scheduler validation.
                 # The handle will be registered in LIVE_HANDLES/TORRENTS
                 # by add_handle_torrents above.
             else:
+                # Scheduler is actively tracking OR no pending management.
+                # Let the scheduler decide.
                 verdict = scheduler.on_add_started(info_hash, handle)
                 if verdict is False:
                     # Scheduler rejected the alert (late alert for a
@@ -1291,24 +1320,25 @@ def _safe_remove_late_handle(handle, info_hash):
 
     Retains TORRENTS/LIVE_HANDLES entries if SESSION.remove_torrent
     fails, and registers the handle in LATE_HANDLE_REMOVAL_RETRIES for
-    bounded retry on subsequent alert-loop iterations. This prevents a
-    failed removal from silently leaking capacity.
+    indefinite retry on subsequent alert-loop iterations. This prevents
+    a failed removal from silently leaking capacity.
 
-    The warning log redacts the info hash to preserve the documented
-    sniff-path logging policy (no per-hash logging).
+    The warning log does NOT include the exception text (which could
+    contain the info hash) to preserve the documented sniff-path logging
+    policy (no per-hash logging).
     """
 
     try:
         SESSION.remove_torrent(handle)
-    except Exception as e:
+    except Exception:
         # Registration for retry: keep the handle around for
         # _drive_sniff_scheduler to retry on the next iteration.
         LATE_HANDLE_REMOVAL_RETRIES.append((handle, info_hash, 0))
-        # Redact info hash from log: sniff-path logging must not include
-        # per-hash information per the documented privacy policy.
+        # Redact both info hash and exception text: sniff-path logging
+        # must not include per-hash information per the documented
+        # privacy policy, and exception text could contain it.
         logging.warning(
-            "failed to remove late handle: %s; registered for retry",
-            e,
+            "failed to remove late handle; registered for retry"
         )
         return
     # Removal succeeded: clear tracking entries.
@@ -1445,26 +1475,31 @@ def _drive_sniff_scheduler(now):
                 LIVE_HANDLES.discard(info_hash)
             scheduler.ack_handle_removed(info_hash, now=now)
 
-    # Retry late-handle removals that previously failed. This is a bounded
-    # retry: each entry is attempted up to MAX_LATE_HANDLE_RETRY_ATTEMPTS
-    # times before being dropped (to prevent unbounded memory growth).
+    # Retry late-handle removals that previously failed. We keep
+    # retrying indefinitely until the removal succeeds; the list is
+    # naturally bounded by the number of late alerts processed. We do
+    # NOT drop entries after a fixed attempt count because doing so
+    # would abandon ownership of a still-live handle, violating the
+    # physical concurrency bound.
     remaining_retries = []
     for handle, info_hash, attempts in LATE_HANDLE_REMOVAL_RETRIES:
-        if attempts >= MAX_LATE_HANDLE_RETRY_ATTEMPTS:
-            # Give up after max attempts. Redact info hash from log.
-            logging.warning(
-                "giving up on late handle removal after %d attempts",
-                attempts,
-            )
-            continue
         removal_succeeded = False
         if handle is not None and handle.is_valid():
             try:
                 SESSION.remove_torrent(handle)
                 removal_succeeded = True
             except Exception:
-                pass
+                # Removal failed; keep the entry for next iteration.
+                # Redact info hash from log to preserve sniff-path
+                # logging policy (no per-hash logging).
+                if attempts == 0:
+                    # Log once on first failure; subsequent failures are
+                    # silent to avoid log spam.
+                    logging.warning(
+                        "late handle removal failed; will retry on next loop"
+                    )
         else:
+            # Handle invalid or None: treat as succeeded (nothing to remove).
             removal_succeeded = True
         if removal_succeeded:
             try:
@@ -1632,22 +1667,32 @@ def main():
     instance_id = os.getenv("MANAGEMENT_INSTANCE_ID", "").strip() or socket.gethostname()
 
     # Wrap the add_torrent callback for management-origin adds. We track
-    # the info-hash in MANAGEMENT_ORIGIN_ADDS so handle_alert_add_torrent
-    # can distinguish management adds from stale scheduler alerts.
+    # a counter per info-hash so handle_alert_add_torrent can distinguish
+    # management adds from stale scheduler alerts. The counter increments
+    # before add_torrent is called and decrements when the corresponding
+    # add_torrent_alert arrives (or if add_torrent fails).
     def _management_add_callback(source):
         # Extract info_hash from source (normalized by management module).
         from management import normalize_source
         _, info_hash = normalize_source(source)
         if info_hash:
-            MANAGEMENT_ORIGIN_ADDS.add(info_hash)
-        return add_torrent(
-            source,
-            session=SESSION,
-            registry=TORRENTS,
-            live_handles=LIVE_HANDLES,
-            options=OPTIONS,
-            trackers=TRACKERS,
-        )
+            MANAGEMENT_ORIGIN_ADDS[info_hash] = MANAGEMENT_ORIGIN_ADDS.get(info_hash, 0) + 1
+        try:
+            return add_torrent(
+                source,
+                session=SESSION,
+                registry=TORRENTS,
+                live_handles=LIVE_HANDLES,
+                options=OPTIONS,
+                trackers=TRACKERS,
+            )
+        except Exception:
+            # add_torrent raised: no alert will arrive, so decrement now.
+            if info_hash:
+                MANAGEMENT_ORIGIN_ADDS[info_hash] -= 1
+                if MANAGEMENT_ORIGIN_ADDS[info_hash] <= 0:
+                    del MANAGEMENT_ORIGIN_ADDS[info_hash]
+            raise
 
     management_service = ManagementService(
         SESSION,

@@ -133,6 +133,14 @@ Report any measured baseline only if actually measured; otherwise document that 
 
 The scheduler's queue, in-flight set, and cooldown registry are in-memory only. A process restart clears them. The authoritative durable signal is the `.torrent` cache file in `TORRENT_DIR`: any hash whose cache file exists is skipped before the scheduler is consulted, even across restarts. Daily cache cleanup (`cleanup_old_cache_files`, default 7 days) removes files older than the configured threshold; hashes whose cache was deleted become eligible for reacquisition, subject to the usual scheduler bounds.
 
+### Capability gap: management provenance without request identity
+
+libtorrent's Python bindings do not expose per-request identifiers on `add_torrent_params`. This limitation affects not only the scheduler's ability to distinguish stale alerts (documented above) but also the ability to distinguish management-origin adds from stale scheduler alerts when both happen for the same info_hash.
+
+**Best-effort protocol:** the scheduler uses a counter (`MANAGEMENT_ORIGIN_ADDS`) to track pending management calls per hash. Combined with the scheduler's state (active vs historical), this correctly handles the favorable ordering where the management alert arrives before any stale scheduler alert. When the ordering is unfavorable (a stale scheduler alert arrives first), the counter is consumed by the stale alert, and the real management alert is misidentified as a stale scheduler alert.
+
+**This is a known limitation**, not a bug. The test `test_old_scheduler_alert_before_management_alert_limitation` documents the actual best-effort behavior. Fully solving this would require libtorrent to expose per-request identifiers or a cancel API (not available in libtorrent 2.0.11).
+
 ### Capability gap: libtorrent cannot identify/cancel submitted adds — design decision required
 
 libtorrent's Python bindings do not expose a per-request identifier on `add_torrent_params`, and do not expose an API to cancel a submitted `async_add_torrent` request before its `add_torrent_alert` arrives. This is a hard API limitation, not a workaround-able bug.
