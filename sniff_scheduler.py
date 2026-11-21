@@ -608,6 +608,27 @@ class SniffScheduler:
             return None
         return candidate.state
 
+    def is_active_owner(self, info_hash: str) -> bool:
+        """Return True if the scheduler is actively tracking this hash.
+
+        "Active" means the candidate is currently being acquired
+        (``IN_FLIGHT`` or ``PENDING_REMOVAL``) or being persisted
+        (``PERSISTING``). Queued, cooldown, and absent states are not
+        considered active ownership: a management API add or external
+        path can legitimately claim the hash in those cases.
+
+        Used by alert handlers to distinguish scheduler-owned metadata
+        from management-origin additions that happen to share an
+        info_hash with a cooldown entry.
+        """
+
+        state = self.state_of(info_hash)
+        return state in (
+            CandidateState.IN_FLIGHT,
+            CandidateState.PENDING_REMOVAL,
+            CandidateState.PERSISTING,
+        )
+
     def queued_count(self) -> int:
         return sum(
             1 for c in self._candidates.values() if c.state is CandidateState.QUEUED
@@ -819,26 +840,34 @@ class SniffScheduler:
 
     def on_add_started(
         self, info_hash: str, handle: Any, *, now: Optional[float] = None
-    ) -> None:
+    ) -> bool:
         """Record that libtorrent produced a valid handle for the hash.
 
         Validates that the candidate is still in ``IN_FLIGHT``. A late
         add_torrent_alert for a candidate that has already transitioned
         (timeout -> pending removal, metadata -> persisting, etc.) is
-        counted as ``late_alert_ignored`` and otherwise dropped.
+        counted as ``late_alert_ignored`` and returns ``False`` so the
+        caller can remove the handle from the session and restore the
+        physical concurrency bound.
+
+        Returns True on success, False when the alert is rejected.
         """
 
         now = self.clock() if now is None else now
         candidate = self._candidates.get(info_hash)
         if candidate is None:
-            return
+            # The scheduler never owned this hash. The caller should
+            # still decide whether to keep or remove the handle; we
+            # return False to signal "not accepted".
+            return False
         if candidate.state is not CandidateState.IN_FLIGHT:
             self.diagnostics.late_alert_ignored += 1
-            return
+            return False
         self._generation += 1
         candidate.handle = handle
         candidate.handle_generation = self._generation
         candidate.started_at = now
+        return True
 
     def on_async_add_failed(
         self,
@@ -871,24 +900,41 @@ class SniffScheduler:
     ) -> None:
         """Count an add_torrent_alert with an invalid handle.
 
-        If the scheduler's candidate already has a DIFFERENT valid handle
-        recorded (from a newer attempt's successful add_torrent_alert),
-        this alert is stale and is counted in ``late_alert_ignored``
-        rather than cooling down the current attempt.
+        Ownership protocol:
+        - If the candidate has a recorded handle, compare by identity.
+          A different handle indicates a stale alert; reject.
+        - If the candidate's handle is ``None`` (async_add_torrent was
+          submitted but no add_torrent_alert has been registered yet),
+          we cannot determine whether this alert belongs to the current
+          or a previous attempt. Conservative action: do NOT change the
+          candidate's state. The no-handle acquisition timeout in
+          ``_collect_pending_removals`` will clean up the candidate
+          eventually, and the physical concurrency bound is preserved
+          because the slot stays occupied until then.
         """
 
         now = self.clock() if now is None else now
         self.diagnostics.invalid_handle_alert += 1
         candidate = self._candidates.get(info_hash)
-        if (
-            candidate is not None
-            and candidate.handle is not None
-            and alert_handle is not None
-            and candidate.handle is not alert_handle
-        ):
+        if candidate is None:
+            # The scheduler never owned this hash.
+            return
+        if candidate.state is not CandidateState.IN_FLIGHT:
             self.diagnostics.late_alert_ignored += 1
             return
-        self.on_async_add_failed(info_hash, now=now)
+        if candidate.handle is not None:
+            # We have a registered handle; compare by identity.
+            if alert_handle is not None and candidate.handle is not alert_handle:
+                self.diagnostics.late_alert_ignored += 1
+                return
+            # alert_handle matches or is None; accept as current.
+            self.diagnostics.add_failed_async += 1
+            self._enter_cooldown(info_hash, now=now)
+            return
+        # candidate.handle is None: we cannot determine ownership.
+        # Conservative: don't change state. The no-handle timeout will
+        # release the slot eventually.
+        self.diagnostics.late_alert_ignored += 1
 
     def on_sync_add_failure(
         self, info_hash: str, *, now: Optional[float] = None
@@ -969,9 +1015,16 @@ class SniffScheduler:
     ) -> bool:
         """metadata_received fired but ``torrent_file`` was None.
 
-        When ``handle`` is supplied, validates ownership against the
-        candidate's recorded handle. A stale alert from a previous
-        attempt is rejected and counted in ``late_alert_ignored``.
+        Ownership protocol (mirrors ``on_invalid_handle_alert``):
+        - If the candidate has a recorded handle, compare by identity.
+          A different handle indicates a stale alert; reject.
+        - If the candidate's handle is ``None`` (no add_torrent_alert
+          registered yet), we cannot determine ownership. Conservative
+          action: do NOT change state. The no-handle acquisition timeout
+          will eventually clean up the candidate.
+
+        Returns True when the candidate was transitioned to cooldown,
+        False otherwise.
         """
 
         now = self.clock() if now is None else now
@@ -982,7 +1035,12 @@ class SniffScheduler:
         if candidate.state is not CandidateState.IN_FLIGHT:
             self.diagnostics.late_alert_ignored += 1
             return False
-        if handle is not None and candidate.handle is not None and candidate.handle is not handle:
+        if candidate.handle is None:
+            # Cannot determine ownership without a recorded handle.
+            # Conservative: don't change state.
+            self.diagnostics.late_alert_ignored += 1
+            return False
+        if handle is not None and candidate.handle is not handle:
             self.diagnostics.late_alert_ignored += 1
             return False
         self._enter_cooldown(info_hash, now=now)
@@ -1056,9 +1114,9 @@ class SniffScheduler:
         """Apply pending persist results on the alert-loop thread.
 
         Each result is matched to the candidate's current
-        ``persisting_job_id``. A stale result (from an earlier attempt
-        that timed out and was reused for a newer attempt) is discarded
-        so it cannot settle the new attempt.
+        ``persisting_job_id`` strictly. A stale result (from an earlier
+        attempt, including legacy ``job_id=0`` results) is discarded so
+        it cannot settle a newer attempt.
         """
 
         now = self.clock() if now is None else now
@@ -1070,8 +1128,10 @@ class SniffScheduler:
             candidate = self._candidates.get(result.info_hash)
             if candidate is None or candidate.state is not CandidateState.PERSISTING:
                 continue
-            if result.job_id and candidate.persisting_job_id != result.job_id:
-                # Stale result from an earlier attempt.
+            # Strict job_id matching: job_id=0 is NOT a wildcard. Only
+            # a result whose job_id matches the candidate's current
+            # persisting_job_id is accepted.
+            if candidate.persisting_job_id != result.job_id:
                 continue
             if result.success:
                 self.diagnostics.persist_success += 1
@@ -1080,6 +1140,36 @@ class SniffScheduler:
             else:
                 self.diagnostics.persist_failure += 1
                 self._enter_cooldown(result.info_hash, now=now)
+
+    def on_persist_complete(
+        self, info_hash: str, success: bool, job_id: int
+    ) -> bool:
+        """Called from the metadata worker after persisting completes.
+
+        Atomically handles ``TORRENTS`` cleanup and scheduler state
+        transition. Returns True if this worker's job was accepted
+        (job_id matched the candidate's current ``persisting_job_id``);
+        False if it was stale (a newer attempt owns the hash now).
+
+        The caller should ONLY delete ``TORRENTS[info_hash]`` when this
+        returns True, so a newer attempt's reservation is preserved.
+        """
+
+        candidate = self._candidates.get(info_hash)
+        if candidate is None or candidate.state is not CandidateState.PERSISTING:
+            return False
+        if candidate.persisting_job_id != job_id:
+            # Stale job: a newer attempt owns the hash now.
+            return False
+        # Accepted. Transition the candidate.
+        if success:
+            self.diagnostics.persist_success += 1
+            self.cooldowns.clear(info_hash)
+            self._clear_candidate(info_hash)
+        else:
+            self.diagnostics.persist_failure += 1
+            self._enter_cooldown(info_hash, now=self.clock())
+        return True
 
     # ------------------------------------------------------------------
     # Periodic maintenance

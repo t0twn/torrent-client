@@ -400,19 +400,36 @@ class SchedulerLifecycleTests(unittest.TestCase):
     def test_metadata_missing_routes_to_cooldown(self):
         scheduler, clock = make_scheduler()
         scheduler.on_announce(HASH_A, now=clock())
+        handle = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle, now=clock())
 
-        owned = scheduler.on_metadata_missing(HASH_A, now=clock())
+        owned = scheduler.on_metadata_missing(HASH_A, handle=handle, now=clock())
 
         self.assertTrue(owned)
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
         self.assertEqual(scheduler.diagnostics.metadata_missing, 1)
 
+    def test_metadata_missing_without_handle_is_conservative(self):
+        """When the candidate has no registered handle, a missing-metadata
+        alert must NOT change state (conservative protocol)."""
+
+        scheduler, clock = make_scheduler()
+        scheduler.on_announce(HASH_A, now=clock())
+        self.assertIsNone(scheduler.handle_for(HASH_A))
+
+        owned = scheduler.on_metadata_missing(HASH_A, now=clock())
+
+        self.assertFalse(owned)
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.diagnostics.late_alert_ignored, 1)
+
     def test_persist_success_clears_state(self):
         scheduler, clock = make_scheduler()
         scheduler.on_announce(HASH_A, now=clock())
-        scheduler.on_metadata_received(HASH_A, now=clock())
+        job_id = scheduler.on_metadata_received(HASH_A, now=clock())
+        self.assertIsNotNone(job_id)
 
-        scheduler.enqueue_persist_result(HASH_A, True)
+        scheduler.enqueue_persist_result(HASH_A, True, job_id=job_id)
         scheduler.drain_persist_results(now=clock())
 
         self.assertIsNone(scheduler.state_of(HASH_A))
@@ -422,9 +439,9 @@ class SchedulerLifecycleTests(unittest.TestCase):
     def test_persist_failure_enters_cooldown(self):
         scheduler, clock = make_scheduler()
         scheduler.on_announce(HASH_A, now=clock())
-        scheduler.on_metadata_received(HASH_A, now=clock())
+        job_id = scheduler.on_metadata_received(HASH_A, now=clock())
 
-        scheduler.enqueue_persist_result(HASH_A, False)
+        scheduler.enqueue_persist_result(HASH_A, False, job_id=job_id)
         scheduler.drain_persist_results(now=clock())
 
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
@@ -444,12 +461,31 @@ class SchedulerLifecycleTests(unittest.TestCase):
     def test_async_add_failed_enters_cooldown(self):
         scheduler, clock = make_scheduler()
         scheduler.on_announce(HASH_A, now=clock())
+        handle = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle, now=clock())
 
-        scheduler.on_invalid_handle_alert(HASH_A, now=clock())
+        # Invalid alert for the same handle: accepted as current.
+        scheduler.on_invalid_handle_alert(HASH_A, alert_handle=handle, now=clock())
 
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
         self.assertEqual(scheduler.diagnostics.add_failed_async, 1)
         self.assertEqual(scheduler.diagnostics.invalid_handle_alert, 1)
+
+    def test_invalid_handle_alert_without_handle_is_conservative(self):
+        """When the candidate has no registered handle, an invalid alert
+        must NOT change state (conservative protocol)."""
+
+        scheduler, clock = make_scheduler()
+        scheduler.on_announce(HASH_A, now=clock())
+        self.assertIsNone(scheduler.handle_for(HASH_A))
+
+        # Invalid alert arrives before on_add_started registered a handle.
+        scheduler.on_invalid_handle_alert(HASH_A, now=clock())
+
+        # State is unchanged; slot is still occupied.
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.diagnostics.late_alert_ignored, 1)
+        self.assertEqual(scheduler.diagnostics.add_failed_async, 0)
 
     def test_sync_add_failure_releases_slot(self):
         scheduler, clock = make_scheduler(max_concurrent_acquisitions=1)
@@ -624,10 +660,10 @@ class PersistResultQueueTests(unittest.TestCase):
     def test_enqueue_is_thread_safe(self):
         scheduler, clock = make_scheduler()
         scheduler.on_announce(HASH_A, now=clock())
-        scheduler.on_metadata_received(HASH_A, now=clock())
+        job_id = scheduler.on_metadata_received(HASH_A, now=clock())
 
         def worker():
-            scheduler.enqueue_persist_result(HASH_A, True)
+            scheduler.enqueue_persist_result(HASH_A, True, job_id=job_id)
 
         thread = threading.Thread(target=worker)
         thread.start()
@@ -639,11 +675,11 @@ class PersistResultQueueTests(unittest.TestCase):
     def test_stale_persist_result_is_ignored(self):
         scheduler, clock = make_scheduler()
         scheduler.on_announce(HASH_A, now=clock())
-        scheduler.on_metadata_received(HASH_A, now=clock())
+        job_id = scheduler.on_metadata_received(HASH_A, now=clock())
 
         # Manually clear state (simulating a concurrent eviction path).
         scheduler._candidates.pop(HASH_A)
-        scheduler.enqueue_persist_result(HASH_A, True)
+        scheduler.enqueue_persist_result(HASH_A, True, job_id=job_id)
         scheduler.drain_persist_results(now=clock())
 
         # No counter should increment for a hash the scheduler no longer owns.
@@ -970,8 +1006,8 @@ class TTLCacheSurvivalTests(unittest.TestCase):
         scheduler, clock = make_scheduler()
         # Simulate a full success cycle.
         scheduler.on_announce(HASH_A, now=clock())
-        scheduler.on_metadata_received(HASH_A, now=clock())
-        scheduler.enqueue_persist_result(HASH_A, True)
+        job_id = scheduler.on_metadata_received(HASH_A, now=clock())
+        scheduler.enqueue_persist_result(HASH_A, True, job_id=job_id)
         scheduler.drain_persist_results(now=clock())
         self.assertIsNone(scheduler.state_of(HASH_A))
 
@@ -1108,8 +1144,8 @@ class RegressionTests(unittest.TestCase):
         hashes = [f"{i:040d}" for i in range(10)]
         for h in hashes:
             scheduler.on_announce(h, now=clock())
-            scheduler.on_metadata_received(h, now=clock())
-            scheduler.enqueue_persist_result(h, True)
+            job_id = scheduler.on_metadata_received(h, now=clock())
+            scheduler.enqueue_persist_result(h, True, job_id=job_id)
 
         scheduler.drain_persist_results(now=clock())
 
@@ -1123,11 +1159,11 @@ class RegressionTests(unittest.TestCase):
     def test_f3_latest_persist_result_wins(self):
         scheduler, clock = make_scheduler()
         scheduler.on_announce(HASH_A, now=clock())
-        scheduler.on_metadata_received(HASH_A, now=clock())
+        job_id = scheduler.on_metadata_received(HASH_A, now=clock())
 
         # Worker reports failure, then success (out-of-order but same hash).
-        scheduler.enqueue_persist_result(HASH_A, False)
-        scheduler.enqueue_persist_result(HASH_A, True)
+        scheduler.enqueue_persist_result(HASH_A, False, job_id=job_id)
+        scheduler.enqueue_persist_result(HASH_A, True, job_id=job_id)
         scheduler.drain_persist_results(now=clock())
 
         # The success result wins; no cooldown.
@@ -1248,15 +1284,15 @@ class SecondRoundRegressionTests(unittest.TestCase):
 
         scheduler.on_announce(HASH_A, now=clock())
         scheduler.on_announce(HASH_B, now=clock())
-        scheduler.on_metadata_received(HASH_A, now=clock())
-        scheduler.on_metadata_received(HASH_B, now=clock())
+        job_id_a = scheduler.on_metadata_received(HASH_A, now=clock())
+        job_id_b = scheduler.on_metadata_received(HASH_B, now=clock())
 
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PERSISTING)
         self.assertEqual(scheduler.state_of(HASH_B), ss.CandidateState.PERSISTING)
 
         # Both report success before drain.
-        scheduler.enqueue_persist_result(HASH_A, True)
-        scheduler.enqueue_persist_result(HASH_B, True)
+        scheduler.enqueue_persist_result(HASH_A, True, job_id=job_id_a)
+        scheduler.enqueue_persist_result(HASH_B, True, job_id=job_id_b)
         scheduler.drain_persist_results(now=clock())
 
         # Both must have been cleared.
@@ -1502,7 +1538,9 @@ class ThirdRoundRegressionTests(unittest.TestCase):
 
         # First attempt fails immediately (invalid handle).
         scheduler.on_announce(HASH_A, now=clock())
-        scheduler.on_invalid_handle_alert(HASH_A)
+        handle_first = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle_first, now=clock())
+        scheduler.on_invalid_handle_alert(HASH_A, alert_handle=handle_first)
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
 
         # Cooldown expires, second attempt starts.
@@ -1516,16 +1554,29 @@ class ThirdRoundRegressionTests(unittest.TestCase):
         # Tell scheduler add_torrent was called.
         scheduler.on_add_torrent_called(HASH_A, now=clock())
 
-        # An old invalid alert from attempt 1 arrives. Because the
-        # candidate has no handle but add_torrent was just called, we
-        # treat the alert as stale only if we have strong evidence.
-        # With no handle to compare, we err on the side of acceptance
-        # (this is a known limitation documented in PR description).
-        # The test verifies we don't crash.
+        # An old invalid alert arrives. With the conservative protocol,
+        # since candidate.handle is None, the alert is IGNORED (counted
+        # as late_alert_ignored). The slot stays occupied; the no-handle
+        # acquisition timeout will eventually release it if no real
+        # add_torrent_alert arrives.
         scheduler.on_invalid_handle_alert(HASH_A)
-        # State may or may not change depending on timing heuristics;
-        # the key invariant is that new in-flight attempts don't get
-        # silently cancelled without explicit stale-evidence.
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.diagnostics.late_alert_ignored, 1)
+
+    def test_f2_invalid_alert_with_matching_handle_transitions(self):
+        """When the candidate HAS a registered handle, an invalid alert
+        with the SAME handle is accepted and transitions to COOLDOWN."""
+
+        scheduler, clock = make_scheduler()
+        scheduler.on_announce(HASH_A, now=clock())
+        handle = SimpleNamespace(is_valid=lambda: True)
+        scheduler.on_add_started(HASH_A, handle, now=clock())
+
+        # Invalid alert with the same handle.
+        scheduler.on_invalid_handle_alert(HASH_A, alert_handle=handle)
+
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+        self.assertEqual(scheduler.diagnostics.add_failed_async, 1)
 
     # F3: old missing-metadata alert must not cancel new attempt.
     def test_f3_old_metadata_missing_doesnt_cancel_new(self):
@@ -1675,6 +1726,294 @@ class ThirdRoundRegressionTests(unittest.TestCase):
         item = metadata_queue.get_nowait()
         # New format: (torrent_file, info_hash, job_id=0 for non-scheduler path)
         self.assertEqual(item[1], HASH_A)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for fourth correction round (post-merge at bdc3a22)
+# ---------------------------------------------------------------------------
+
+class FourthRoundRegressionTests(unittest.TestCase):
+    """Verify fixes for the 5 findings that survived the merge.
+
+    Each test exercises the actual alert-loop/worker interleaving the
+    reviewer identified, not just the method in isolation.
+    """
+
+    # F1: late valid add alert must not keep a handle in LIVE_HANDLES.
+    def test_f1_late_add_alert_after_no_handle_timeout(self):
+        """An in-flight candidate times out with no handle; the slot is
+        released. A late add_torrent_alert with a valid handle arrives;
+        handle_alert_add_torrent must remove it so the physical
+        concurrency bound is restored.
+
+        Also: a second hash must be able to take the released slot."""
+
+        import app as app_module
+        import queue as queue_module
+
+        scheduler, clock = make_scheduler(
+            acquisition_timeout=5.0,
+            max_concurrent_acquisitions=1,
+        )
+        removed = []
+        session = SimpleNamespace(
+            async_add_torrent=lambda p: None,
+            remove_torrent=lambda h: removed.append(h),
+        )
+        torrents = app_module.TTLDict(maxsize=100, ttl=600)
+        live_handles = app_module.LiveHandles(maxsize=100)
+
+        class FakeLT:
+            dht_pkt_alert = type("dht_pkt_alert", (), {})
+            metadata_received_alert = type("metadata_received_alert", (), {})
+
+            class add_torrent_alert:
+                pass
+
+        class FakeHandle:
+            def __init__(self, info_hash):
+                self.info_hash = info_hash
+                self._valid = True
+                self._status = SimpleNamespace(
+                    torrent_file=None,
+                    info_hashes=SimpleNamespace(
+                        has_v1=lambda: True, has_v2=lambda: False, v1=info_hash,
+                    ),
+                )
+                self.paused = False
+                self.connections = None
+                self.uploads = None
+
+            def is_valid(self):
+                return self._valid
+
+            def status(self):
+                return self._status
+
+            def pause(self):
+                self.paused = True
+
+            def set_max_connections(self, n):
+                self.connections = n
+
+            def set_max_uploads(self, n):
+                self.uploads = n
+
+        patches = [
+            patch.object(app_module, "OPTIONS", SimpleNamespace(download_mode=False, save_path="/tmp"), create=True),
+            patch.object(app_module, "SESSION", session, create=True),
+            patch.object(app_module, "TORRENTS", torrents, create=True),
+            patch.object(app_module, "LIVE_HANDLES", live_handles),
+            patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+            patch.object(app_module, "TORRENT_DIR", "/tmp"),
+            patch.object(app_module, "TRACKERS", [], create=True),
+            patch.object(app_module, "METADATA_QUEUE", queue_module.Queue(maxsize=20)),
+            patch.object(app_module, "lt", FakeLT),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        # First attempt starts; no add_torrent_alert arrives.
+        scheduler.on_announce(HASH_A, now=clock())
+        self.assertEqual(scheduler.in_flight_count(), 1)
+
+        # Timeout: candidate is cleaned up (no handle to remove).
+        clock.advance(10.0)
+        scheduler.tick(now=clock())
+        self.assertEqual(scheduler.in_flight_count(), 0)
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+
+        # A second hash takes the released slot.
+        admission = scheduler.on_announce(HASH_B, now=clock())
+        self.assertEqual(admission, ss.Admission.ADMITTED_STARTED)
+        self.assertEqual(scheduler.in_flight_count(), 1)
+
+        # Now the late add_torrent_alert for HASH_A arrives with a valid handle.
+        late_handle = FakeHandle(HASH_A)
+        # Register HASH_A in TORRENTS (as add_torrent would have done).
+        torrents.put(HASH_A, None)
+        alert = FakeLT.add_torrent_alert()
+        alert.handle = late_handle
+        alert.params = SimpleNamespace(
+            info_hashes=SimpleNamespace(
+                has_v1=lambda: True, has_v2=lambda: False, v1=HASH_A,
+            )
+        )
+        app_module.handle_alert_add_torrent(alert)
+
+        # Late alert was rejected; handle was removed.
+        self.assertIn(late_handle, removed)
+        self.assertNotIn(HASH_A, live_handles)
+        # HASH_B's slot is unaffected.
+        self.assertEqual(scheduler.in_flight_count(), 1)
+        self.assertEqual(scheduler.state_of(HASH_B), ss.CandidateState.IN_FLIGHT)
+
+    # F2/F3: old alert without handle registered must NOT cancel new attempt.
+    def test_f2_f3_old_alert_before_new_handle_conservative(self):
+        """Old timeout -> new submit -> old invalid/missing alert arrives.
+        With no registered handle, the new attempt is NOT cancelled."""
+
+        scheduler, clock = make_scheduler(acquisition_timeout=5.0)
+
+        # Old attempt starts and times out with no handle.
+        scheduler.on_announce(HASH_A, now=clock())
+        clock.advance(6.0)
+        scheduler.tick(now=clock())  # no-handle timeout
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+        self.assertEqual(scheduler.in_flight_count(), 0)
+
+        # Cooldown expires, new attempt starts.
+        clock.advance(100.0)
+        scheduler.on_announce(HASH_A, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.in_flight_count(), 1)
+
+        # Old invalid alert arrives (no handle on new candidate yet).
+        scheduler.on_invalid_handle_alert(HASH_A)
+        # Conservative: state is unchanged, slot still occupied.
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.in_flight_count(), 1)
+
+        # Old missing-metadata alert also arrives.
+        scheduler.on_metadata_missing(HASH_A)
+        # Still unchanged.
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.in_flight_count(), 1)
+
+    # F4: old worker must not delete new reservation; job_id=0 is not a wildcard.
+    def test_f4_old_worker_doesnt_delete_new_reservation(self):
+        """Old worker completes after a new reservation exists. The new
+        reservation must NOT be deleted by the old worker."""
+
+        scheduler, clock = make_scheduler()
+
+        # First attempt enters PERSISTING with job_id=1.
+        scheduler.on_announce(HASH_A, now=clock())
+        job_id_1 = scheduler.on_metadata_received(HASH_A, now=clock())
+        self.assertEqual(job_id_1, 1)
+
+        # PERSISTING timeout: enters cooldown.
+        clock.advance(1000.0)
+        scheduler.tick(now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+
+        # Cooldown expires.
+        clock.advance(1000.0)
+
+        # Second attempt enters PERSISTING with job_id=2.
+        scheduler.on_announce(HASH_A, now=clock())
+        job_id_2 = scheduler.on_metadata_received(HASH_A, now=clock())
+        self.assertEqual(job_id_2, 2)
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PERSISTING)
+
+        # Old worker's result (job_id=1) arrives.
+        accepted = scheduler.on_persist_complete(HASH_A, True, job_id=job_id_1)
+        # Rejected: not the current job.
+        self.assertFalse(accepted)
+        # Attempt 2 is still PERSISTING.
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PERSISTING)
+
+        # Correct result (job_id=2) arrives.
+        accepted = scheduler.on_persist_complete(HASH_A, True, job_id=job_id_2)
+        self.assertTrue(accepted)
+        self.assertIsNone(scheduler.state_of(HASH_A))
+
+    def test_f4_zero_job_id_is_not_wildcard(self):
+        """A result with job_id=0 must NOT settle a PERSISTING candidate
+        that has a positive persisting_job_id."""
+
+        scheduler, clock = make_scheduler()
+        scheduler.on_announce(HASH_A, now=clock())
+        job_id = scheduler.on_metadata_received(HASH_A, now=clock())
+        self.assertGreater(job_id, 0)
+
+        # job_id=0 result arrives: must be ignored.
+        scheduler.enqueue_persist_result(HASH_A, False, job_id=0)
+        scheduler.drain_persist_results(now=clock())
+
+        # Candidate is still PERSISTING; not cooled down.
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.PERSISTING)
+        self.assertEqual(scheduler.diagnostics.persist_failure, 0)
+
+    # F5: management API during scheduler cooldown still persists.
+    def test_f5_management_add_during_cooldown_persists(self):
+        """Scheduler has HASH_A in COOLDOWN. Management API adds the same
+        hash (bypassing scheduler). Metadata arrives; persistence must
+        proceed."""
+
+        import app as app_module
+        import queue as queue_module
+
+        tmpdir_obj = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir_obj.cleanup)
+
+        metadata_queue = queue_module.Queue(maxsize=20)
+        torrents = app_module.TTLDict(maxsize=100, ttl=600)
+        live_handles = app_module.LiveHandles(maxsize=100)
+        scheduler, clock = make_scheduler()
+
+        # Put scheduler in COOLDOWN state for HASH_A.
+        scheduler.on_announce(HASH_A, now=clock())
+        scheduler.on_async_add_failed(HASH_A, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+
+        # Management API registers the hash directly in TORRENTS.
+        torrents.put(HASH_A, None)
+        handle = SimpleNamespace(
+            is_valid=lambda: True,
+            status=lambda: SimpleNamespace(
+                torrent_file=SimpleNamespace(
+                    info_hashes=SimpleNamespace(
+                        has_v1=lambda: True, has_v2=lambda: False, v1=HASH_A,
+                    )
+                ),
+                info_hashes=SimpleNamespace(
+                    has_v1=lambda: True, has_v2=lambda: False, v1=HASH_A,
+                ),
+            ),
+            pause=lambda: None,
+        )
+        live_handles.put(HASH_A, handle)
+
+        session = SimpleNamespace(
+            async_add_torrent=lambda p: None,
+            remove_torrent=lambda h: None,
+        )
+
+        class FakeLT:
+            dht_pkt_alert = type("dht_pkt_alert", (), {})
+            add_torrent_alert = type("add_torrent_alert", (), {})
+
+            class metadata_received_alert:
+                pass
+
+        patches = [
+            patch.object(app_module, "OPTIONS", SimpleNamespace(download_mode=False), create=True),
+            patch.object(app_module, "SESSION", session, create=True),
+            patch.object(app_module, "TORRENTS", torrents, create=True),
+            patch.object(app_module, "LIVE_HANDLES", live_handles),
+            patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+            patch.object(app_module, "TORRENT_DIR", tmpdir_obj.name),
+            patch.object(app_module, "TRACKERS", [], create=True),
+            patch.object(app_module, "METADATA_QUEUE", metadata_queue),
+            patch.object(app_module, "lt", FakeLT),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        # Metadata alert arrives.
+        alert = FakeLT.metadata_received_alert()
+        alert.handle = handle
+        app_module.handle_alert_metadata_received(alert)
+
+        # Persistence is queued (management path, not scheduler-owned).
+        self.assertFalse(metadata_queue.empty())
+        item = metadata_queue.get_nowait()
+        self.assertEqual(item[1], HASH_A)
+        # Scheduler is still in COOLDOWN (not mutated).
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
 
 
 if __name__ == "__main__":

@@ -872,12 +872,29 @@ def metadata_worker():
         try:
             success = persist_torrent_metadata(torrent_file, info_hash)
         finally:
-            try:
-                del TORRENTS[info_hash]
-            except KeyError:
-                pass
+            # Conditional TORRENTS cleanup: only delete if this worker's
+            # job is still the current owner. A newer attempt may have
+            # reserved the same hash after this job started; in that
+            # case we must NOT delete the new reservation.
+            accepted = False
             if SNIFF_SCHEDULER is not None:
-                SNIFF_SCHEDULER.enqueue_persist_result(info_hash, success, job_id)
+                accepted = SNIFF_SCHEDULER.on_persist_complete(
+                    info_hash, success, job_id
+                )
+            if not accepted:
+                # Either no scheduler (legacy path), or this was a
+                # non-scheduler job (job_id=0 from management API) that
+                # was never registered with the scheduler, or the job
+                # was stale. For the non-scheduler case, clean up TORRENTS
+                # directly. For the stale case, leave the new reservation
+                # intact.
+                if SNIFF_SCHEDULER is None or (
+                    SNIFF_SCHEDULER.state_of(info_hash) is None
+                ):
+                    try:
+                        del TORRENTS[info_hash]
+                    except KeyError:
+                        pass
             METADATA_QUEUE.task_done()
 
 
@@ -926,17 +943,17 @@ def handle_alert_metadata_received(a):
         _teardown_metadata_handle_by_handle(handle, None)
         return
 
-    # Determine whether the scheduler owns this hash. If it does, the
-    # alert must pass handle validation. If it doesn't (e.g. the hash
-    # was added via management API), we proceed with the legacy
-    # persistence path.
+    # Determine whether the scheduler actively owns this hash. Active
+    # ownership means IN_FLIGHT, PENDING_REMOVAL, or PERSISTING. States
+    # like COOLDOWN or QUEUED are historical; a management API add for
+    # the same hash during cooldown should proceed with legacy
+    # persistence.
     scheduler_owned = False
     scheduler_job_id = 0
     scheduler_queue_full = False
     if scheduler is not None:
-        candidate_state = scheduler.state_of(info_hash)
-        if candidate_state is not None:
-            # Scheduler owns this hash; validate handle ownership.
+        if scheduler.is_active_owner(info_hash):
+            # Scheduler actively owns this hash; validate handle ownership.
             job_id = scheduler.on_metadata_received(info_hash, handle=handle)
             if job_id is None:
                 # Stale alert: handle didn't match. Don't queue
@@ -946,7 +963,8 @@ def handle_alert_metadata_received(a):
                 return
             scheduler_owned = True
             scheduler_job_id = job_id
-        # else: scheduler doesn't own this hash (management API case);
+        # else: scheduler doesn't actively own this hash (e.g. during
+        # cooldown from a previous attempt, or management API added it);
         # proceed with legacy persistence.
     # If no scheduler, also proceed with legacy persistence.
 
@@ -1223,7 +1241,20 @@ def handle_alert_add_torrent(a):
         except AttributeError:
             info_hash = None
         if info_hash is not None:
-            scheduler.on_add_started(info_hash, handle)
+            accepted = scheduler.on_add_started(info_hash, handle)
+            if not accepted:
+                # The scheduler has moved on from this attempt (e.g., it
+                # timed out with no handle and released its slot). The
+                # late add_torrent_alert must not keep the handle in
+                # LIVE_HANDLES/TORRENTS; remove it now to restore the
+                # physical concurrency bound.
+                SESSION.remove_torrent(handle)
+                if LIVE_HANDLES is not None:
+                    LIVE_HANDLES.discard(info_hash)
+                try:
+                    del TORRENTS[info_hash]
+                except KeyError:
+                    pass
 
 
 def handle_alert_log(a):
