@@ -103,6 +103,19 @@ class SniffSchedulerConfig:
     max_starts_per_second: float = 1.0
     start_rate_window: float = 1.0
     acquisition_timeout: float = 120.0
+    # Hard timeout for candidates that never received a handle. This is
+    # much longer than acquisition_timeout to preserve the physical
+    # concurrency bound: a slot stays occupied until either the
+    # add_torrent_alert arrives (handle registered) or this hard timeout
+    # fires (accepting that libtorrent may have a stale request).
+    #
+    # libtorrent's Python bindings do not expose a per-request identifier
+    # on add_torrent_params, so we cannot distinguish an old add alert
+    # from a new one for the same hash. The conservative behavior is to
+    # keep the slot occupied until this hard timeout, preventing a new
+    # same-hash attempt from starting while a stale alert could claim it.
+    # See README for the full capability-gap discussion.
+    no_handle_hard_timeout: float = 3600.0
     queue_wait_timeout: float = 300.0
     persist_timeout: float = 600.0
     cooldown_base_seconds: float = 30.0
@@ -123,6 +136,7 @@ class SniffSchedulerConfig:
             "max_starts_per_second",
             "start_rate_window",
             "acquisition_timeout",
+            "no_handle_hard_timeout",
             "queue_wait_timeout",
             "persist_timeout",
             "cooldown_base_seconds",
@@ -156,6 +170,7 @@ def config_from_environment() -> SniffSchedulerConfig:
         max_starts_per_second=_env_float("SNIFF_MAX_STARTS_PER_SECOND", 1.0),
         start_rate_window=_env_float("SNIFF_START_RATE_WINDOW", 1.0),
         acquisition_timeout=_env_float("SNIFF_ACQUISITION_TIMEOUT", 120.0),
+        no_handle_hard_timeout=_env_float("SNIFF_NO_HANDLE_HARD_TIMEOUT", 3600.0),
         queue_wait_timeout=_env_float("SNIFF_QUEUE_WAIT_TIMEOUT", 300.0),
         persist_timeout=_env_float("SNIFF_PERSIST_TIMEOUT", 600.0),
         cooldown_base_seconds=_env_float("SNIFF_COOLDOWN_BASE", 30.0),
@@ -840,26 +855,30 @@ class SniffScheduler:
 
     def on_add_started(
         self, info_hash: str, handle: Any, *, now: Optional[float] = None
-    ) -> bool:
+    ) -> Optional[bool]:
         """Record that libtorrent produced a valid handle for the hash.
+
+        Returns a tri-state:
+        - ``True``: the scheduler owned this hash and accepted the alert.
+        - ``False``: the scheduler owned this hash but REJECTED the alert
+          (late alert for a previous attempt, or candidate not in a state
+          that accepts handles). Caller must remove the handle.
+        - ``None``: the scheduler never owned this hash (management API
+          add, or download-mode add). Caller should NOT remove the handle;
+          it's a legitimate addition outside the scheduler's scope.
 
         Validates that the candidate is still in ``IN_FLIGHT``. A late
         add_torrent_alert for a candidate that has already transitioned
         (timeout -> pending removal, metadata -> persisting, etc.) is
-        counted as ``late_alert_ignored`` and returns ``False`` so the
-        caller can remove the handle from the session and restore the
-        physical concurrency bound.
-
-        Returns True on success, False when the alert is rejected.
+        counted as ``late_alert_ignored`` and returns ``False``.
         """
 
         now = self.clock() if now is None else now
         candidate = self._candidates.get(info_hash)
         if candidate is None:
-            # The scheduler never owned this hash. The caller should
-            # still decide whether to keep or remove the handle; we
-            # return False to signal "not accepted".
-            return False
+            # Scheduler never owned this hash. Could be a management API
+            # add or download-mode add. Don't touch the handle.
+            return None
         if candidate.state is not CandidateState.IN_FLIGHT:
             self.diagnostics.late_alert_ignored += 1
             return False
@@ -1110,13 +1129,18 @@ class SniffScheduler:
         self,
         *,
         now: Optional[float] = None,
-    ) -> None:
+    ) -> List[Tuple[str, bool]]:
         """Apply pending persist results on the alert-loop thread.
 
         Each result is matched to the candidate's current
         ``persisting_job_id`` strictly. A stale result (from an earlier
         attempt, including legacy ``job_id=0`` results) is discarded so
         it cannot settle a newer attempt.
+
+        Returns the list of ``(info_hash, success)`` pairs for jobs that
+        were accepted (state transitioned). The caller uses this to
+        clean up ``TORRENTS`` reservations on the alert-loop thread,
+        preserving thread safety.
         """
 
         now = self.clock() if now is None else now
@@ -1124,6 +1148,7 @@ class SniffScheduler:
             results = list(self._persist_results.values())
             self._persist_results.clear()
 
+        completed: List[Tuple[str, bool]] = []
         for result in results:
             candidate = self._candidates.get(result.info_hash)
             if candidate is None or candidate.state is not CandidateState.PERSISTING:
@@ -1140,6 +1165,8 @@ class SniffScheduler:
             else:
                 self.diagnostics.persist_failure += 1
                 self._enter_cooldown(result.info_hash, now=now)
+            completed.append((result.info_hash, result.success))
+        return completed
 
     def on_persist_complete(
         self, info_hash: str, success: bool, job_id: int
@@ -1244,6 +1271,7 @@ class SniffScheduler:
 
     def _collect_pending_removals(self, now: float) -> List[Tuple[str, Any]]:
         timeout = self.config.acquisition_timeout
+        hard_timeout = self.config.no_handle_hard_timeout
         result: List[Tuple[str, Any]] = []
         for info_hash, candidate in list(self._candidates.items()):
             # Return previously-timed-out candidates whose removal hasn't
@@ -1256,23 +1284,40 @@ class SniffScheduler:
                 continue
             if candidate.started_at is None:
                 continue
-            if now - candidate.started_at < timeout:
-                continue
-            # Timed out. Two cases:
-            # 1. Has a handle: return for caller to remove from session
-            #    (slot released via ack_handle_removed).
-            # 2. No handle (async_add_torrent called but add_torrent_alert
-            #    never arrived or was lost): release slot directly, enter
-            #    cooldown. This prevents a lost alert from permanently
-            #    occupying an in-flight slot.
+            elapsed = now - candidate.started_at
+
+            # Two cases based on whether we have a handle:
+            #
+            # 1. Has a handle: past acquisition_timeout means the metadata
+            #    acquisition stalled. Return for caller to remove from
+            #    session (slot released via ack_handle_removed).
+            #
+            # 2. No handle yet (async_add_torrent called but add_torrent_alert
+            #    not yet registered via on_add_started):
+            #    - Past acquisition_timeout but not past hard_timeout:
+            #      KEEP the slot occupied. This is the conservative protocol
+            #      for the libtorrent API limitation: we cannot identify
+            #      which attempt an incoming add alert belongs to when
+            #      candidate.handle is None. Releasing the slot early would
+            #      let a new same-hash attempt start, and then a stale
+            #      add_torrent_alert for the old attempt would be accepted
+            #      by on_add_started (candidate is IN_FLIGHT with no handle).
+            #      Keeping the slot occupied prevents this.
+            #    - Past hard_timeout: give up, release the slot. Accept
+            #      that libtorrent may have a stale request.
             if candidate.handle is not None:
-                candidate.state = CandidateState.PENDING_REMOVAL
-                candidate.pending_removal_at = now
-                result.append((info_hash, candidate.handle))
-                self.diagnostics.metadata_timeout += 1
+                if elapsed >= timeout:
+                    candidate.state = CandidateState.PENDING_REMOVAL
+                    candidate.pending_removal_at = now
+                    result.append((info_hash, candidate.handle))
+                    self.diagnostics.metadata_timeout += 1
             else:
-                self.diagnostics.metadata_timeout += 1
-                self._enter_cooldown(info_hash, now=now)
+                # No handle yet.
+                if elapsed >= hard_timeout:
+                    # Hard timeout: give up on this attempt.
+                    self.diagnostics.metadata_timeout += 1
+                    self._enter_cooldown(info_hash, now=now)
+                # Otherwise: keep IN_FLIGHT, slot occupied.
         return result
 
     def ack_handle_removed(self, info_hash: str, *, now: Optional[float] = None) -> None:

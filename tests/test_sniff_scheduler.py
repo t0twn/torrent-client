@@ -1508,21 +1508,30 @@ class ThirdRoundRegressionTests(unittest.TestCase):
 
     # F1: async add without a valid handle must eventually time out.
     def test_f1_no_handle_timeout(self):
-        """An IN_FLIGHT candidate that never receives a handle must
-        time out so its slot is released. Without this fix, a lost
-        add_torrent_alert would permanently occupy an in-flight slot."""
+        """An IN_FLIGHT candidate that never receives a handle stays
+        occupied until the hard timeout. This preserves the physical
+        concurrency bound: a new same-hash attempt cannot start and be
+        wrongly claimed by a stale add_torrent_alert."""
 
-        scheduler, clock = make_scheduler(acquisition_timeout=10.0)
+        scheduler, clock = make_scheduler(
+            acquisition_timeout=10.0,
+            no_handle_hard_timeout=100.0,
+        )
 
         scheduler.on_announce(HASH_A, now=clock())
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
-        # Never call on_add_started — simulates a lost add_torrent_alert.
+        # Never call on_add_started — simulates a delayed add_torrent_alert.
         self.assertIsNone(scheduler.handle_for(HASH_A))
 
+        # Past acquisition_timeout but not past hard_timeout: slot stays occupied.
         clock.advance(11.0)
         scheduler.tick(now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.in_flight_count(), 1)
 
-        # Candidate should have moved to COOLDOWN (no handle to remove).
+        # Past hard_timeout: finally release the slot.
+        clock.advance(100.0)
+        scheduler.tick(now=clock())
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
         self.assertEqual(scheduler.in_flight_count(), 0)
         self.assertEqual(scheduler.diagnostics.metadata_timeout, 1)
@@ -1739,20 +1748,23 @@ class FourthRoundRegressionTests(unittest.TestCase):
     reviewer identified, not just the method in isolation.
     """
 
-    # F1: late valid add alert must not keep a handle in LIVE_HANDLES.
+    # F1: late valid add alert for same hash must be handled correctly.
     def test_f1_late_add_alert_after_no_handle_timeout(self):
-        """An in-flight candidate times out with no handle; the slot is
-        released. A late add_torrent_alert with a valid handle arrives;
-        handle_alert_add_torrent must remove it so the physical
-        concurrency bound is restored.
+        """Conservative no-handle timeout: slot stays occupied until the
+        hard timeout. A late valid add_torrent_alert for the SAME hash
+        is accepted (it's for the current attempt). A different hash
+        cannot take the slot until the hard timeout fires or the current
+        attempt completes.
 
-        Also: a second hash must be able to take the released slot."""
+        Also: management-origin adds bypass the scheduler and their
+        add_torrent_alerts pass through without removing the handle."""
 
         import app as app_module
         import queue as queue_module
 
         scheduler, clock = make_scheduler(
             acquisition_timeout=5.0,
+            no_handle_hard_timeout=100.0,
             max_concurrent_acquisitions=1,
         )
         removed = []
@@ -1818,23 +1830,114 @@ class FourthRoundRegressionTests(unittest.TestCase):
         scheduler.on_announce(HASH_A, now=clock())
         self.assertEqual(scheduler.in_flight_count(), 1)
 
-        # Timeout: candidate is cleaned up (no handle to remove).
+        # Past acquisition_timeout but before hard_timeout: slot stays occupied.
         clock.advance(10.0)
         scheduler.tick(now=clock())
-        self.assertEqual(scheduler.in_flight_count(), 0)
-        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
-
-        # A second hash takes the released slot.
-        admission = scheduler.on_announce(HASH_B, now=clock())
-        self.assertEqual(admission, ss.Admission.ADMITTED_STARTED)
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
         self.assertEqual(scheduler.in_flight_count(), 1)
 
-        # Now the late add_torrent_alert for HASH_A arrives with a valid handle.
-        late_handle = FakeHandle(HASH_A)
-        # Register HASH_A in TORRENTS (as add_torrent would have done).
+        # A different hash CANNOT take the slot (occupied by HASH_A).
+        admission = scheduler.on_announce(HASH_B, now=clock())
+        self.assertEqual(admission, ss.Admission.ADMITTED_QUEUED)
+        self.assertEqual(scheduler.in_flight_count(), 1)
+
+        # Now the add_torrent_alert for HASH_A arrives with a valid handle.
+        # This IS for the current attempt (HASH_A still occupies the slot).
+        handle_a = FakeHandle(HASH_A)
         torrents.put(HASH_A, None)
+        alert_a = FakeLT.add_torrent_alert()
+        alert_a.handle = handle_a
+        alert_a.params = SimpleNamespace(
+            info_hashes=SimpleNamespace(
+                has_v1=lambda: True, has_v2=lambda: False, v1=HASH_A,
+            )
+        )
+        app_module.handle_alert_add_torrent(alert_a)
+
+        # Handle was accepted: registered in LIVE_HANDLES.
+        self.assertIs(live_handles.get(HASH_A), handle_a)
+        self.assertNotIn(handle_a, removed)
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertIs(scheduler.handle_for(HASH_A), handle_a)
+
+    def test_f1_management_add_not_removed(self):
+        """A management-origin add (not scheduler-owned) passes through
+        on_add_started without its handle being removed.
+
+        Flow:
+        1. Management API adds hash via add_torrent (reserves in TORRENTS
+           but scheduler has no candidate for it).
+        2. add_torrent_alert arrives with valid handle.
+        3. handle_alert_add_torrent calls scheduler.on_add_started, which
+           returns None (scheduler doesn't own this hash).
+        4. Handle is NOT removed; registered in LIVE_HANDLES."""
+
+        import app as app_module
+        import queue as queue_module
+
+        # Scheduler has no candidate for HASH_A (management add path).
+        scheduler, clock = make_scheduler()
+        removed = []
+        session = SimpleNamespace(
+            async_add_torrent=lambda p: None,
+            remove_torrent=lambda h: removed.append(h),
+        )
+        torrents = app_module.TTLDict(maxsize=100, ttl=600)
+        live_handles = app_module.LiveHandles(maxsize=100)
+
+        class FakeLT:
+            dht_pkt_alert = type("dht_pkt_alert", (), {})
+            metadata_received_alert = type("metadata_received_alert", (), {})
+
+            class add_torrent_alert:
+                pass
+
+        class FakeHandle:
+            def __init__(self, info_hash):
+                self.info_hash = info_hash
+                self._valid = True
+                self._status = SimpleNamespace(
+                    info_hashes=SimpleNamespace(
+                        has_v1=lambda: True, has_v2=lambda: False, v1=info_hash,
+                    ),
+                )
+
+            def is_valid(self):
+                return self._valid
+
+            def status(self):
+                return self._status
+
+            def set_max_connections(self, n):
+                pass
+
+            def set_max_uploads(self, n):
+                pass
+
+        patches = [
+            patch.object(app_module, "OPTIONS", SimpleNamespace(download_mode=False, save_path="/tmp"), create=True),
+            patch.object(app_module, "SESSION", session, create=True),
+            patch.object(app_module, "TORRENTS", torrents, create=True),
+            patch.object(app_module, "LIVE_HANDLES", live_handles),
+            patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+            patch.object(app_module, "TORRENT_DIR", "/tmp"),
+            patch.object(app_module, "TRACKERS", [], create=True),
+            patch.object(app_module, "METADATA_QUEUE", queue_module.Queue(maxsize=20)),
+            patch.object(app_module, "lt", FakeLT),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        # Management API has reserved the hash in TORRENTS (via add_torrent).
+        # No scheduler candidate exists for this hash.
+        torrents.put(HASH_A, None)
+        self.assertIsNone(scheduler.state_of(HASH_A))
+
+        # add_torrent_alert arrives with a valid handle.
+        handle = FakeHandle(HASH_A)
         alert = FakeLT.add_torrent_alert()
-        alert.handle = late_handle
+        alert.handle = handle
         alert.params = SimpleNamespace(
             info_hashes=SimpleNamespace(
                 has_v1=lambda: True, has_v2=lambda: False, v1=HASH_A,
@@ -1842,24 +1945,39 @@ class FourthRoundRegressionTests(unittest.TestCase):
         )
         app_module.handle_alert_add_torrent(alert)
 
-        # Late alert was rejected; handle was removed.
-        self.assertIn(late_handle, removed)
-        self.assertNotIn(HASH_A, live_handles)
-        # HASH_B's slot is unaffected.
-        self.assertEqual(scheduler.in_flight_count(), 1)
-        self.assertEqual(scheduler.state_of(HASH_B), ss.CandidateState.IN_FLIGHT)
+        # Handle was NOT removed (scheduler doesn't own this hash).
+        self.assertNotIn(handle, removed)
+        # Handle was registered in LIVE_HANDLES.
+        self.assertIs(live_handles.get(HASH_A), handle)
 
     # F2/F3: old alert without handle registered must NOT cancel new attempt.
     def test_f2_f3_old_alert_before_new_handle_conservative(self):
         """Old timeout -> new submit -> old invalid/missing alert arrives.
-        With no registered handle, the new attempt is NOT cancelled."""
+        With the conservative hard-timeout protocol, the old attempt stays
+        IN_FLIGHT (slot occupied) until the hard timeout. A new same-hash
+        attempt cannot start during this window, preventing an old alert
+        from claiming the new attempt."""
 
-        scheduler, clock = make_scheduler(acquisition_timeout=5.0)
+        scheduler, clock = make_scheduler(
+            acquisition_timeout=5.0,
+            no_handle_hard_timeout=100.0,
+        )
 
         # Old attempt starts and times out with no handle.
         scheduler.on_announce(HASH_A, now=clock())
         clock.advance(6.0)
         scheduler.tick(now=clock())  # no-handle timeout
+        # Conservative: slot stays occupied until hard timeout.
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.IN_FLIGHT)
+        self.assertEqual(scheduler.in_flight_count(), 1)
+
+        # A new same-hash attempt CANNOT start during this window.
+        admission = scheduler.on_announce(HASH_A, now=clock())
+        self.assertEqual(admission, ss.Admission.SKIP_IN_FLIGHT)
+
+        # Hard timeout: slot finally released.
+        clock.advance(100.0)
+        scheduler.tick(now=clock())
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
         self.assertEqual(scheduler.in_flight_count(), 0)
 

@@ -71,7 +71,8 @@ Supported scheduler environment settings:
 | `SNIFF_MAX_IN_FLIGHT` | `4` | Maximum concurrent metadata acquisitions |
 | `SNIFF_MAX_STARTS_PER_SECOND` | `1.0` | Maximum new acquisitions started per rate window |
 | `SNIFF_START_RATE_WINDOW` | `1.0` | Rate window in seconds |
-| `SNIFF_ACQUISITION_TIMEOUT` | `120.0` | Seconds before an in-flight acquisition is timed out |
+| `SNIFF_ACQUISITION_TIMEOUT` | `120.0` | Seconds before an in-flight acquisition (with handle) is timed out |
+| `SNIFF_NO_HANDLE_HARD_TIMEOUT` | `3600.0` | Seconds before a no-handle in-flight candidate gives up. See "Capability gap" below. |
 | `SNIFF_QUEUE_WAIT_TIMEOUT` | `300.0` | Seconds a candidate may wait in queue before cooldown |
 | `SNIFF_PERSIST_TIMEOUT` | `600.0` | Seconds a PERSISTING candidate waits before recovery timeout |
 | `SNIFF_COOLDOWN_BASE` | `30.0` | Initial retry delay after failure (seconds) |
@@ -131,6 +132,23 @@ Report any measured baseline only if actually measured; otherwise document that 
 ### Restart and cache cleanup
 
 The scheduler's queue, in-flight set, and cooldown registry are in-memory only. A process restart clears them. The authoritative durable signal is the `.torrent` cache file in `TORRENT_DIR`: any hash whose cache file exists is skipped before the scheduler is consulted, even across restarts. Daily cache cleanup (`cleanup_old_cache_files`, default 7 days) removes files older than the configured threshold; hashes whose cache was deleted become eligible for reacquisition, subject to the usual scheduler bounds.
+
+### Capability gap: libtorrent cannot identify/cancel submitted adds
+
+libtorrent's Python bindings do not expose a per-request identifier on `add_torrent_params`. When `async_add_torrent(hash)` is called, the only way to learn the outcome is via an `add_torrent_alert` that arrives later. This alert does not carry any identifier that ties it to the specific `async_add_torrent` call.
+
+**Consequence:** the scheduler cannot reliably distinguish a stale `add_torrent_alert` (for a previous attempt that has since timed out) from a new `add_torrent_alert` (for the current attempt) when the candidate has no registered handle yet. If the scheduler releases the slot on no-handle timeout and starts a new same-hash attempt, a stale valid `add_torrent_alert` from the old attempt would be accepted by `on_add_started` (candidate is `IN_FLIGHT` with no handle), defeating the duplicate-protection claim.
+
+**Conservative protocol implemented:** the scheduler does NOT release the slot on no-handle timeout. The candidate stays `IN_FLIGHT` (slot occupied) until either:
+1. The `add_torrent_alert` arrives and registers the handle (normal flow or late-but-still-valid response), OR
+2. `SNIFF_NO_HANDLE_HARD_TIMEOUT` (default 3600s) fires, at which point the slot is released and the candidate enters cooldown.
+
+**Trade-offs:**
+- If libtorrent loses an `add_torrent_alert` (rare but possible), the slot stays occupied for up to `SNIFF_NO_HANDLE_HARD_TIMEOUT`. During this time, no new attempt for the same hash can start (slot occupied), and no different-hash attempt can start if all slots are occupied.
+- This preserves the physical concurrency bound at the cost of slower recovery when alerts are genuinely lost.
+- An operator who prefers faster recovery over strict concurrency can reduce `SNIFF_NO_HANDLE_HARD_TIMEOUT`, accepting that a stale alert might claim a new attempt in the race window.
+
+**No strict bound claim:** the scheduler does not claim a strict `SNIFF_MAX_IN_FLIGHT` bound when `SNIFF_NO_HANDLE_HARD_TIMEOUT > 0`. The bound holds only when `async_add_torrent` calls have corresponding `add_torrent_alert` responses within the hard timeout. The conservative protocol is a deliberate design choice, not a bug fix.
 
 ### Hourly / daily budget policy
 
