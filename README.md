@@ -71,7 +71,8 @@ Supported scheduler environment settings:
 | `SNIFF_MAX_IN_FLIGHT` | `4` | Maximum concurrent metadata acquisitions |
 | `SNIFF_MAX_STARTS_PER_SECOND` | `1.0` | Maximum new acquisitions started per rate window |
 | `SNIFF_START_RATE_WINDOW` | `1.0` | Rate window in seconds |
-| `SNIFF_ACQUISITION_TIMEOUT` | `120.0` | Seconds before an in-flight acquisition is timed out |
+| `SNIFF_ACQUISITION_TIMEOUT` | `120.0` | Seconds before an in-flight acquisition (with handle) is timed out |
+| `SNIFF_NO_HANDLE_HARD_TIMEOUT` | `3600.0` | Seconds before a no-handle in-flight candidate gives up. See "Capability gap" below. |
 | `SNIFF_QUEUE_WAIT_TIMEOUT` | `300.0` | Seconds a candidate may wait in queue before cooldown |
 | `SNIFF_PERSIST_TIMEOUT` | `600.0` | Seconds a PERSISTING candidate waits before recovery timeout |
 | `SNIFF_COOLDOWN_BASE` | `30.0` | Initial retry delay after failure (seconds) |
@@ -131,6 +132,30 @@ Report any measured baseline only if actually measured; otherwise document that 
 ### Restart and cache cleanup
 
 The scheduler's queue, in-flight set, and cooldown registry are in-memory only. A process restart clears them. The authoritative durable signal is the `.torrent` cache file in `TORRENT_DIR`: any hash whose cache file exists is skipped before the scheduler is consulted, even across restarts. Daily cache cleanup (`cleanup_old_cache_files`, default 7 days) removes files older than the configured threshold; hashes whose cache was deleted become eligible for reacquisition, subject to the usual scheduler bounds.
+
+### Capability gap: libtorrent cannot identify/cancel submitted adds — design decision required
+
+libtorrent's Python bindings do not expose a per-request identifier on `add_torrent_params`, and do not expose an API to cancel a submitted `async_add_torrent` request before its `add_torrent_alert` arrives. This is a hard API limitation, not a workaround-able bug.
+
+**Consequence:** the scheduler cannot reliably distinguish a stale `add_torrent_alert` (for a previous attempt that has since timed out) from a new `add_torrent_alert` (for the current attempt) when the candidate has no registered handle yet. After the hard timeout fires and the scheduler releases the slot, a delayed valid alert from the OLD request will be accepted by `on_add_started` as the NEW attempt (the candidate is `IN_FLIGHT` with no handle).
+
+**This means the physical concurrency bound cannot be made strict while also allowing recovery from lost alerts.** These two properties are in tension when libtorrent cannot identify or cancel a request. You must choose one:
+
+**Option A (current default): Weaken the strict bound.**
+- The scheduler releases the slot on hard timeout (`SNIFF_NO_HANDLE_HARD_TIMEOUT`, default 3600s), accepting that physical concurrency may exceed `SNIFF_MAX_IN_FLIGHT` during the race window where a stale alert arrives.
+- This allows recovery from lost alerts but admits a brief over-capacity window.
+- **Requires human owner's explicit approval to weaken the strict-bound acceptance criterion in T0TW-9.**
+
+**Option B: Strict bound, no recovery from lost alerts.**
+- The scheduler keeps the slot occupied indefinitely (or for a very long time) until the alert arrives or the process restarts.
+- If the alert is genuinely lost, the slot is stuck forever.
+- This preserves the strict bound but loses recovery capability.
+
+**Option C (requires libtorrent enhancement):** If libtorrent adds per-request identifiers or a cancel API, the scheduler can implement strict identity validation and both properties can be achieved simultaneously. This is a feature request, not available in libtorrent 2.0.11.
+
+**Current implementation: Option A** with `SNIFF_NO_HANDLE_HARD_TIMEOUT=3600.0` default. The conservative hard timeout limits (but does not eliminate) the race window. Operators who prefer Option B can set `SNIFF_NO_HANDLE_HARD_TIMEOUT` to a very large value. Operators who need strict bounds AND recovery must wait for libtorrent enhancement (Option C) or accept that one property must give.
+
+**This is a design decision, not a technical completion.** The PR documents the trade-off and defaults to Option A, but the human owner must explicitly approve weakening the strict-bound acceptance criterion. The scheduler will not claim technical completion of the strict-bound requirement until this decision is made and documented.
 
 ### Hourly / daily budget policy
 

@@ -67,6 +67,29 @@ MANAGEMENT_SERVER = None
 LIVE_HANDLES = None
 SNIFF_SCHEDULER = None
 
+# Module-level set tracking info-hashes that were submitted via management
+# API (not via the scheduler). When add_torrent is called from management,
+# we register the hash here. When the corresponding add_torrent_alert
+# arrives, handle_alert_add_torrent checks this set and passes the alert
+# through without scheduler validation.
+#
+# This is necessary because the scheduler cannot distinguish a management
+# add from a stale scheduler alert when the candidate is in COOLDOWN
+# state. By tracking management-origin adds explicitly, we ensure that
+# management API adds during scheduler cooldown are not wrongly removed.
+#
+# This set is only meaningful in sniff mode; in download mode, there's
+# no scheduler to conflict with.
+MANAGEMENT_ORIGIN_ADDS: set = set()
+
+# Bounded collection of (handle, info_hash, attempts) tuples for handles
+# whose removal failed. _drive_sniff_scheduler retries these on each
+# alert-loop iteration up to MAX_LATE_HANDLE_RETRY_ATTEMPTS times.
+# This prevents a failed SESSION.remove_torrent from silently leaking
+# capacity.
+LATE_HANDLE_REMOVAL_RETRIES: list = []
+MAX_LATE_HANDLE_RETRY_ATTEMPTS = 3
+
 
 def env_int(name, default):
     value = os.getenv(name)
@@ -860,6 +883,16 @@ def persist_torrent_metadata(torrent_file, info_hash):
 
 
 def metadata_worker():
+    """Background persistence worker.
+
+    This runs on a worker thread and must NOT mutate scheduler state
+    directly. Instead, it enqueues results via the thread-safe
+    ``enqueue_persist_result`` method. The alert loop's
+    ``drain_persist_results`` applies state transitions, and
+    ``_drive_sniff_scheduler`` cleans up TORRENTS reservations on the
+    alert-loop thread.
+    """
+
     while True:
         item = METADATA_QUEUE.get()
         # Backwards compatibility: older code queued (torrent_file, info_hash);
@@ -872,12 +905,20 @@ def metadata_worker():
         try:
             success = persist_torrent_metadata(torrent_file, info_hash)
         finally:
-            try:
-                del TORRENTS[info_hash]
-            except KeyError:
-                pass
+            # Thread-safe result delivery: enqueue for the alert loop to
+            # drain. Do NOT mutate scheduler state or delete TORRENTS
+            # here; that must happen on the alert-loop thread.
             if SNIFF_SCHEDULER is not None:
-                SNIFF_SCHEDULER.enqueue_persist_result(info_hash, success, job_id)
+                SNIFF_SCHEDULER.enqueue_persist_result(
+                    info_hash, success, job_id
+                )
+            else:
+                # No scheduler: legacy path. Safe to delete TORRENTS here
+                # because the alert loop isn't tracking this hash.
+                try:
+                    del TORRENTS[info_hash]
+                except KeyError:
+                    pass
             METADATA_QUEUE.task_done()
 
 
@@ -926,17 +967,17 @@ def handle_alert_metadata_received(a):
         _teardown_metadata_handle_by_handle(handle, None)
         return
 
-    # Determine whether the scheduler owns this hash. If it does, the
-    # alert must pass handle validation. If it doesn't (e.g. the hash
-    # was added via management API), we proceed with the legacy
-    # persistence path.
+    # Determine whether the scheduler actively owns this hash. Active
+    # ownership means IN_FLIGHT, PENDING_REMOVAL, or PERSISTING. States
+    # like COOLDOWN or QUEUED are historical; a management API add for
+    # the same hash during cooldown should proceed with legacy
+    # persistence.
     scheduler_owned = False
     scheduler_job_id = 0
     scheduler_queue_full = False
     if scheduler is not None:
-        candidate_state = scheduler.state_of(info_hash)
-        if candidate_state is not None:
-            # Scheduler owns this hash; validate handle ownership.
+        if scheduler.is_active_owner(info_hash):
+            # Scheduler actively owns this hash; validate handle ownership.
             job_id = scheduler.on_metadata_received(info_hash, handle=handle)
             if job_id is None:
                 # Stale alert: handle didn't match. Don't queue
@@ -946,7 +987,8 @@ def handle_alert_metadata_received(a):
                 return
             scheduler_owned = True
             scheduler_job_id = job_id
-        # else: scheduler doesn't own this hash (management API case);
+        # else: scheduler doesn't actively own this hash (e.g. during
+        # cooldown from a previous attempt, or management API added it);
         # proceed with legacy persistence.
     # If no scheduler, also proceed with legacy persistence.
 
@@ -1223,7 +1265,59 @@ def handle_alert_add_torrent(a):
         except AttributeError:
             info_hash = None
         if info_hash is not None:
-            scheduler.on_add_started(info_hash, handle)
+            # Check if this is a management-origin add (registered by the
+            # management callback wrapper). If so, bypass scheduler
+            # validation and let the handle stay.
+            is_management_add = info_hash in MANAGEMENT_ORIGIN_ADDS
+            if is_management_add:
+                MANAGEMENT_ORIGIN_ADDS.discard(info_hash)
+                # Management add: pass through without scheduler validation.
+                # The handle will be registered in LIVE_HANDLES/TORRENTS
+                # by add_handle_torrents above.
+            else:
+                verdict = scheduler.on_add_started(info_hash, handle)
+                if verdict is False:
+                    # Scheduler rejected the alert (late alert for a
+                    # previous attempt that has moved on). Remove the handle
+                    # to restore the physical concurrency bound.
+                    _safe_remove_late_handle(handle, info_hash)
+                # verdict is True (scheduler accepted) or None (scheduler
+                # doesn't own this hash, e.g. download-mode add): leave the
+                # handle in place.
+
+
+def _safe_remove_late_handle(handle, info_hash):
+    """Remove a late add_torrent_alert's handle from the session.
+
+    Retains TORRENTS/LIVE_HANDLES entries if SESSION.remove_torrent
+    fails, and registers the handle in LATE_HANDLE_REMOVAL_RETRIES for
+    bounded retry on subsequent alert-loop iterations. This prevents a
+    failed removal from silently leaking capacity.
+
+    The warning log redacts the info hash to preserve the documented
+    sniff-path logging policy (no per-hash logging).
+    """
+
+    try:
+        SESSION.remove_torrent(handle)
+    except Exception as e:
+        # Registration for retry: keep the handle around for
+        # _drive_sniff_scheduler to retry on the next iteration.
+        LATE_HANDLE_REMOVAL_RETRIES.append((handle, info_hash, 0))
+        # Redact info hash from log: sniff-path logging must not include
+        # per-hash information per the documented privacy policy.
+        logging.warning(
+            "failed to remove late handle: %s; registered for retry",
+            e,
+        )
+        return
+    # Removal succeeded: clear tracking entries.
+    if LIVE_HANDLES is not None:
+        LIVE_HANDLES.discard(info_hash)
+    try:
+        del TORRENTS[info_hash]
+    except KeyError:
+        pass
 
 
 def handle_alert_log(a):
@@ -1286,13 +1380,23 @@ def _drive_sniff_scheduler(now):
     tracking maps, then ``ack_handle_removed`` releases the slot. This
     prevents a stale handle from continuing to consume a slot after the
     scheduler has moved on.
+
+    Persist results are drained on the alert-loop thread (not the worker
+    thread), and TORRENTS cleanup happens here too. This keeps all
+    scheduler state mutations on a single thread.
     """
 
     scheduler = SNIFF_SCHEDULER
     if scheduler is None:
         return
 
-    scheduler.drain_persist_results(now=now)
+    # Drain persist results and clean up TORRENTS on the alert-loop thread.
+    completed_jobs = scheduler.drain_persist_results(now=now)
+    for info_hash, _ in completed_jobs:
+        try:
+            del TORRENTS[info_hash]
+        except KeyError:
+            pass
 
     def _cache_exists(info_hash):
         return os.path.exists(os.path.join(TORRENT_DIR, info_hash + '.torrent'))
@@ -1322,10 +1426,11 @@ def _drive_sniff_scheduler(now):
                 SESSION.remove_torrent(handle)
                 removal_succeeded = True
             except Exception as e:
+                # Redact info hash from log to preserve sniff-path logging policy.
                 logging.warning(
-                    "failed to remove timed-out handle for %s: %s; "
+                    "failed to remove timed-out handle: %s; "
                     "will retry on next loop",
-                    info_hash, e,
+                    e,
                 )
         else:
             # Handle already invalid / None: treat removal as succeeded.
@@ -1339,6 +1444,39 @@ def _drive_sniff_scheduler(now):
             if LIVE_HANDLES is not None:
                 LIVE_HANDLES.discard(info_hash)
             scheduler.ack_handle_removed(info_hash, now=now)
+
+    # Retry late-handle removals that previously failed. This is a bounded
+    # retry: each entry is attempted up to MAX_LATE_HANDLE_RETRY_ATTEMPTS
+    # times before being dropped (to prevent unbounded memory growth).
+    remaining_retries = []
+    for handle, info_hash, attempts in LATE_HANDLE_REMOVAL_RETRIES:
+        if attempts >= MAX_LATE_HANDLE_RETRY_ATTEMPTS:
+            # Give up after max attempts. Redact info hash from log.
+            logging.warning(
+                "giving up on late handle removal after %d attempts",
+                attempts,
+            )
+            continue
+        removal_succeeded = False
+        if handle is not None and handle.is_valid():
+            try:
+                SESSION.remove_torrent(handle)
+                removal_succeeded = True
+            except Exception:
+                pass
+        else:
+            removal_succeeded = True
+        if removal_succeeded:
+            try:
+                del TORRENTS[info_hash]
+            except KeyError:
+                pass
+            if LIVE_HANDLES is not None:
+                LIVE_HANDLES.discard(info_hash)
+        else:
+            remaining_retries.append((handle, info_hash, attempts + 1))
+    LATE_HANDLE_REMOVAL_RETRIES.clear()
+    LATE_HANDLE_REMOVAL_RETRIES.extend(remaining_retries)
 
     scheduler.maybe_emit_diagnostics(now=now)
 
@@ -1492,17 +1630,29 @@ def main():
     LIVE_HANDLES = LiveHandles(maxsize=MAX_TORRENTS)
 
     instance_id = os.getenv("MANAGEMENT_INSTANCE_ID", "").strip() or socket.gethostname()
-    management_service = ManagementService(
-        SESSION,
-        LIVE_HANDLES,
-        partial(
-            add_torrent,
+
+    # Wrap the add_torrent callback for management-origin adds. We track
+    # the info-hash in MANAGEMENT_ORIGIN_ADDS so handle_alert_add_torrent
+    # can distinguish management adds from stale scheduler alerts.
+    def _management_add_callback(source):
+        # Extract info_hash from source (normalized by management module).
+        from management import normalize_source
+        _, info_hash = normalize_source(source)
+        if info_hash:
+            MANAGEMENT_ORIGIN_ADDS.add(info_hash)
+        return add_torrent(
+            source,
             session=SESSION,
             registry=TORRENTS,
             live_handles=LIVE_HANDLES,
             options=OPTIONS,
             trackers=TRACKERS,
-        ),
+        )
+
+    management_service = ManagementService(
+        SESSION,
+        LIVE_HANDLES,
+        _management_add_callback,
         instance_id=instance_id,
         mode="download" if OPTIONS.download_mode else "sniff",
         pending_registry=TORRENTS,
