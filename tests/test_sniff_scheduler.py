@@ -2134,5 +2134,210 @@ class FourthRoundRegressionTests(unittest.TestCase):
         self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
 
 
+# ---------------------------------------------------------------------------
+# Regression tests for latest PR #6 local verification (head 4b2a6b0)
+# ---------------------------------------------------------------------------
+
+class LatestVerificationRegressionTests(unittest.TestCase):
+    """Verify fixes for the 3 remaining paths identified by Engineering
+    Lead after head 4b2a6b0.
+
+    Each test exercises the actual alert-loop/worker interleaving that
+    was reproduced in the focused review.
+    """
+
+    # Blocker 1: management add during scheduler cooldown.
+    def test_management_add_during_cooldown_not_removed(self):
+        """A management-origin add during scheduler COOLDOWN must NOT
+        have its valid add_torrent_alert removed. The scheduler has a
+        COOLDOWN candidate for the same hash, but the management
+        callback wrapper registers it in MANAGEMENT_ORIGIN_ADDS so the
+        alert handler bypasses scheduler validation.
+
+        Full path: management add → add_torrent_alert → LIVE_HANDLES
+        registration, scheduler state unchanged."""
+
+        import app as app_module
+        import queue as queue_module
+
+        scheduler, clock = make_scheduler()
+        removed = []
+        session = SimpleNamespace(
+            async_add_torrent=lambda p: None,
+            remove_torrent=lambda h: removed.append(h),
+        )
+        torrents = app_module.TTLDict(maxsize=100, ttl=600)
+        live_handles = app_module.LiveHandles(maxsize=100)
+
+        # Put scheduler in COOLDOWN for HASH_A.
+        scheduler.on_announce(HASH_A, now=clock())
+        scheduler.on_async_add_failed(HASH_A, now=clock())
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+
+        class FakeLT:
+            dht_pkt_alert = type("dht_pkt_alert", (), {})
+            metadata_received_alert = type("metadata_received_alert", (), {})
+
+            class add_torrent_alert:
+                pass
+
+        class FakeHandle:
+            def __init__(self, info_hash):
+                self.info_hash = info_hash
+                self._valid = True
+                self._status = SimpleNamespace(
+                    info_hashes=SimpleNamespace(
+                        has_v1=lambda: True, has_v2=lambda: False, v1=info_hash,
+                    ),
+                )
+
+            def is_valid(self):
+                return self._valid
+
+            def status(self):
+                return self._status
+
+            def set_max_connections(self, n):
+                pass
+
+            def set_max_uploads(self, n):
+                pass
+
+        patches = [
+            patch.object(app_module, "OPTIONS", SimpleNamespace(download_mode=False, save_path="/tmp"), create=True),
+            patch.object(app_module, "SESSION", session, create=True),
+            patch.object(app_module, "TORRENTS", torrents, create=True),
+            patch.object(app_module, "LIVE_HANDLES", live_handles),
+            patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+            patch.object(app_module, "TORRENT_DIR", "/tmp"),
+            patch.object(app_module, "TRACKERS", [], create=True),
+            patch.object(app_module, "METADATA_QUEUE", queue_module.Queue(maxsize=20)),
+            patch.object(app_module, "lt", FakeLT),
+            patch.object(app_module, "MANAGEMENT_ORIGIN_ADDS", {HASH_A}),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        # Management API has reserved HASH_A in TORRENTS.
+        torrents.put(HASH_A, None)
+
+        # add_torrent_alert arrives for the management add.
+        handle = FakeHandle(HASH_A)
+        alert = FakeLT.add_torrent_alert()
+        alert.handle = handle
+        alert.params = SimpleNamespace(
+            info_hashes=SimpleNamespace(
+                has_v1=lambda: True, has_v2=lambda: False, v1=HASH_A,
+            )
+        )
+        app_module.handle_alert_add_torrent(alert)
+
+        # Handle was NOT removed (management origin bypassed scheduler).
+        self.assertNotIn(handle, removed)
+        # Handle was registered in LIVE_HANDLES.
+        self.assertIs(live_handles.get(HASH_A), handle)
+        # Scheduler state unchanged (still COOLDOWN).
+        self.assertEqual(scheduler.state_of(HASH_A), ss.CandidateState.COOLDOWN)
+
+    # Blocker 3: failed late-handle removal retry.
+    def test_failed_late_handle_removal_retries(self):
+        """A failed SESSION.remove_torrent in _safe_remove_late_handle
+        registers the handle for retry. _drive_sniff_scheduler processes
+        the retry queue and removes the handle on a subsequent attempt.
+        """
+
+        import app as app_module
+
+        remove_attempts = []
+
+        def failing_remove(handle):
+            remove_attempts.append(handle)
+            if len(remove_attempts) < 2:
+                raise RuntimeError("simulated removal failure")
+
+        scheduler, clock = make_scheduler()
+        session = SimpleNamespace(
+            async_add_torrent=lambda p: None,
+            remove_torrent=failing_remove,
+        )
+        torrents = app_module.TTLDict(maxsize=100, ttl=600)
+        live_handles = app_module.LiveHandles(maxsize=100)
+        handle = SimpleNamespace(is_valid=lambda: True)
+
+        patches = [
+            patch.object(app_module, "SESSION", session, create=True),
+            patch.object(app_module, "TORRENTS", torrents, create=True),
+            patch.object(app_module, "LIVE_HANDLES", live_handles),
+            patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        # Register the handle in LIVE_HANDLES/TORRENTS (simulating what
+        # add_handle_torrents does before scheduler.on_add_started is
+        # called).
+        live_handles.put(HASH_A, handle)
+        torrents.put(HASH_A, handle)
+
+        # First removal fails; handle is registered for retry.
+        app_module._safe_remove_late_handle(handle, HASH_A)
+        self.assertEqual(len(app_module.LATE_HANDLE_REMOVAL_RETRIES), 1)
+        # Handle still in LIVE_HANDLES (removal failed).
+        self.assertIs(live_handles.get(HASH_A), handle)
+
+        # _drive_sniff_scheduler retries on next iteration; this time
+        # removal succeeds.
+        app_module._drive_sniff_scheduler(clock())
+        self.assertEqual(len(remove_attempts), 2)
+        self.assertEqual(len(app_module.LATE_HANDLE_REMOVAL_RETRIES), 0)
+        # Handle was removed from LIVE_HANDLES.
+        self.assertIsNone(live_handles.get(HASH_A))
+
+    # Blocker 3: failed retry is bounded.
+    def test_failed_late_handle_removal_bounded(self):
+        """After MAX_LATE_HANDLE_RETRY_ATTEMPTS, the retry entry is
+        dropped to prevent unbounded memory growth."""
+
+        import app as app_module
+
+        def always_failing_remove(handle):
+            raise RuntimeError("permanent failure")
+
+        scheduler, clock = make_scheduler()
+        session = SimpleNamespace(
+            async_add_torrent=lambda p: None,
+            remove_torrent=always_failing_remove,
+        )
+        torrents = app_module.TTLDict(maxsize=100, ttl=600)
+        live_handles = app_module.LiveHandles(maxsize=100)
+        handle = SimpleNamespace(is_valid=lambda: True)
+
+        patches = [
+            patch.object(app_module, "SESSION", session, create=True),
+            patch.object(app_module, "TORRENTS", torrents, create=True),
+            patch.object(app_module, "LIVE_HANDLES", live_handles),
+            patch.object(app_module, "SNIFF_SCHEDULER", scheduler),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        live_handles.put(HASH_A, handle)
+        torrents.put(HASH_A, handle)
+
+        # Register the handle for retry.
+        app_module._safe_remove_late_handle(handle, HASH_A)
+        self.assertEqual(len(app_module.LATE_HANDLE_REMOVAL_RETRIES), 1)
+
+        # Drive enough iterations to exceed max attempts.
+        for _ in range(app_module.MAX_LATE_HANDLE_RETRY_ATTEMPTS + 2):
+            app_module._drive_sniff_scheduler(clock())
+
+        # Entry was dropped after exceeding max attempts.
+        self.assertEqual(len(app_module.LATE_HANDLE_REMOVAL_RETRIES), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
