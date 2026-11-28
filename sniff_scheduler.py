@@ -623,6 +623,28 @@ class SniffScheduler:
             return None
         return candidate.state
 
+    def clear_cooldown_if_present(self, info_hash: str) -> bool:
+        """Clear a COOLDOWN candidate for the given hash if present.
+
+        This is used by the management API callback to prevent stale
+        scheduler alerts from being misidentified as management alerts.
+        When a management add comes in for a hash that's in COOLDOWN,
+        we clear the COOLDOWN state so subsequent alerts see "no
+        scheduler candidate" and correctly treat as management-origin.
+
+        Returns True if a COOLDOWN candidate was cleared, False otherwise.
+        """
+
+        candidate = self._candidates.get(info_hash)
+        if candidate is None:
+            return False
+        if candidate.state is not CandidateState.COOLDOWN:
+            return False
+        self._candidates.pop(info_hash, None)
+        # Also clear the cooldown registry entry if present.
+        self.cooldowns.clear(info_hash)
+        return True
+
     def is_active_owner(self, info_hash: str) -> bool:
         """Return True if the scheduler is actively tracking this hash.
 

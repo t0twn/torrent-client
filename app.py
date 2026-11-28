@@ -89,12 +89,12 @@ MANAGEMENT_ORIGIN_ADDS: dict = {}  # info_hash -> pending count
 
 # Bounded collection of (handle, info_hash, attempts) tuples for handles
 # whose removal failed. _drive_sniff_scheduler retries these on each
-# alert-loop iteration indefinitely until removal succeeds. We do NOT
-# drop entries after a fixed attempt count because doing so would abandon
-# ownership of a still-live handle, violating the physical concurrency
-# bound. The list is naturally bounded by the number of late alerts
-# processed (each adds at most one entry).
-LATE_HANDLE_REMOVAL_RETRIES: list = []
+# alert-loop iteration. The deque is bounded by MAX_LATE_HANDLE_RETRIES
+# to prevent unbounded memory growth under sustained removal failures.
+# When full, the oldest entry is dropped (accepting that its handle may
+# remain unremoved). This trades perfect cleanup for bounded memory.
+LATE_HANDLE_REMOVAL_RETRIES: deque = deque(maxlen=64)
+MAX_LATE_HANDLE_RETRIES = 64
 
 
 def env_int(name, default):
@@ -1475,13 +1475,18 @@ def _drive_sniff_scheduler(now):
                 LIVE_HANDLES.discard(info_hash)
             scheduler.ack_handle_removed(info_hash, now=now)
 
-    # Retry late-handle removals that previously failed. We keep
-    # retrying indefinitely until the removal succeeds; the list is
-    # naturally bounded by the number of late alerts processed. We do
-    # NOT drop entries after a fixed attempt count because doing so
-    # would abandon ownership of a still-live handle, violating the
-    # physical concurrency bound.
-    remaining_retries = []
+    # Retry late-handle removals that previously failed. The deque is
+    # bounded by MAX_LATE_HANDLE_RETRIES (currently 64); when full, the
+    # oldest entry is dropped automatically. This bounds memory under
+    # sustained removal failures. Entries are NOT dropped after a fixed
+    # attempt count: we keep retrying until success or until the deque
+    # itself overflows. Under normal operation, removal failures are
+    # transient and succeed on retry; permanent failures are bounded by
+    # the deque size and do not block the alert loop.
+    #
+    # Build a new deque to preserve attempt counts while removing
+    # succeeded entries.
+    remaining_retries = deque(maxlen=LATE_HANDLE_REMOVAL_RETRIES.maxlen)
     for handle, info_hash, attempts in LATE_HANDLE_REMOVAL_RETRIES:
         removal_succeeded = False
         if handle is not None and handle.is_valid():
@@ -1675,10 +1680,18 @@ def main():
         # Extract info_hash from source (normalized by management module).
         from management import normalize_source
         _, info_hash = normalize_source(source)
+        # Before adding the marker, clear any scheduler COOLDOWN state
+        # for this hash. This prevents stale scheduler alerts from being
+        # misidentified as management alerts when the scheduler has a
+        # historical COOLDOWN candidate. With COOLDOWN cleared, the
+        # alert handler sees "no scheduler candidate" and correctly
+        # treats the alert as management-origin.
+        if info_hash and SNIFF_SCHEDULER is not None:
+            SNIFF_SCHEDULER.clear_cooldown_if_present(info_hash)
         if info_hash:
             MANAGEMENT_ORIGIN_ADDS[info_hash] = MANAGEMENT_ORIGIN_ADDS.get(info_hash, 0) + 1
         try:
-            return add_torrent(
+            accepted = add_torrent(
                 source,
                 session=SESSION,
                 registry=TORRENTS,
@@ -1693,6 +1706,14 @@ def main():
                 if MANAGEMENT_ORIGIN_ADDS[info_hash] <= 0:
                     del MANAGEMENT_ORIGIN_ADDS[info_hash]
             raise
+        if not accepted:
+            # add_torrent returned False (duplicate/capacity): no alert
+            # will arrive, so decrement now.
+            if info_hash:
+                MANAGEMENT_ORIGIN_ADDS[info_hash] -= 1
+                if MANAGEMENT_ORIGIN_ADDS[info_hash] <= 0:
+                    del MANAGEMENT_ORIGIN_ADDS[info_hash]
+        return accepted
 
     management_service = ManagementService(
         SESSION,
